@@ -159,6 +159,20 @@ def upload_frame(frame_path, job_num, token):
     return result["url"]
 
 
+def upsert_task(job_num, frame_idx, token, status, frame_number=None, output_url="", worker_host=""):
+    """PUT a task row to record per-frame timing and status (best-effort)."""
+    try:
+        path = f"/jobs/{job_num}/tasks/{frame_idx:03d}"
+        _api("PUT", path, token, {
+            "status":       status,
+            "frame_number": frame_number if frame_number is not None else frame_idx + 1,
+            "output_url":   output_url,
+            "worker_host":  worker_host,
+        })
+    except Exception:
+        pass  # non-critical
+
+
 def post_logs(job_num, frame_idx, lines, token, level="info"):
     """POST log lines for a task to the task-logs endpoint (best-effort)."""
     if not lines:
@@ -373,6 +387,15 @@ def render_job(job, blender_path, token):
                worker_host=WORKER_HOSTNAME,
                status_description=f"Rendering on {WORKER_HOSTNAME}")
 
+    # Create per-frame task rows with started_at = NOW()
+    # (all frames share one Blender process, so start time is approximate)
+    total_frames = int(end) - int(start) + 1
+    for fi in range(total_frames):
+        upsert_task(job_num, fi, token,
+                    status="running",
+                    frame_number=int(start) + fi,
+                    worker_host=WORKER_HOSTNAME)
+
     with tempfile.TemporaryDirectory(prefix="rf_work_") as work_dir:
         # ── Download scene ────────────────────────────────────────────
         if use_v7:
@@ -443,6 +466,13 @@ def render_job(job, blender_path, token):
         for i, frame_file in enumerate(frame_files, 1):
             url = upload_frame(str(frame_file), job_num, token)
             frame_urls.append(url)
+            frame_idx = i - 1  # 0-based
+            # Record per-frame completed_at (time of upload = proxy for render done)
+            upsert_task(job_num, frame_idx, token,
+                        status="done",
+                        frame_number=int(start) + frame_idx,
+                        output_url=url,
+                        worker_host=WORKER_HOSTNAME)
             print(f"        [{i}/{len(frame_files)}] {frame_file.name}")
 
         # ── Done ──────────────────────────────────────────────────────
