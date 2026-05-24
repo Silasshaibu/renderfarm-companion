@@ -159,6 +159,17 @@ def upload_frame(frame_path, job_num, token):
     return result["url"]
 
 
+def post_logs(job_num, frame_idx, lines, token, level="info"):
+    """POST log lines for a task to the task-logs endpoint (best-effort)."""
+    if not lines:
+        return
+    try:
+        path = f"/jobs/{job_num}/tasks/{frame_idx:03d}/logs"
+        _api("POST", path, token, {"lines": lines, "level": level})
+    except Exception:
+        pass  # non-critical — console output is the source of truth
+
+
 # ── GPU detection ─────────────────────────────────────────────────────────────
 def detect_gpu():
     """
@@ -398,8 +409,22 @@ def render_job(job, blender_path, token):
 
         # Print last 20 lines of Blender output for debugging
         blender_out = proc.stdout or ""
-        for line in blender_out.strip().splitlines()[-20:]:
+        all_log_lines = blender_out.strip().splitlines()
+        for line in all_log_lines[-20:]:
             print(f"    {line}")
+
+        # POST full Blender output to the task-log API (frame index 0)
+        # The dashboard task-log page will display these lines live.
+        if all_log_lines:
+            info_lines  = [l for l in all_log_lines
+                           if not any(k in l.lower() for k in ("error", "exception", "traceback"))]
+            error_lines = [l for l in all_log_lines
+                           if any(k in l.lower() for k in ("error", "exception", "traceback"))]
+            # Frame index 0 = the first task row in the dashboard
+            frame_start_idx = int(start) - (int(start) if manifest.get("frame_start") else 0)
+            frame_start_idx = 0  # post to task 0 — all frames share one render process
+            post_logs(job_num, frame_start_idx, info_lines,  token, level="info")
+            post_logs(job_num, frame_start_idx, error_lines, token, level="error")
 
         if proc.returncode != 0:
             raise RuntimeError(f"Blender exited with code {proc.returncode}")
