@@ -15,6 +15,13 @@ const api = {
   shell: {
     open: (url: string) => ipcRenderer.invoke('shell:open', url),
   },
+  frames: {
+    download: (outputs: string[], jobNumber: string) =>
+      ipcRenderer.invoke('frames:download', { outputs, jobNumber }) as
+        Promise<{ success: boolean; count?: number; folder?: string; error?: string }>,
+    onProgress: (cb: (data: { jobNumber: string; count: number; total: number }) => void) =>
+      ipcRenderer.on('frames:progress', (_e, data) => cb(data)),
+  },
   updater: {
     check:    ()  => ipcRenderer.invoke('updater:check')    as Promise<string | null>,
     download: ()  => ipcRenderer.invoke('updater:download') as Promise<void>,

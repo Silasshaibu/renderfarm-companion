@@ -37,7 +37,7 @@ export default function App() {
   const renderPage = () => {
     switch (activePage) {
       case 'plugins':        return <PluginsPage />
-      case 'downloader':     return <DownloaderPage setStatus={setStatusMsg} />
+      case 'downloader':     return <DownloaderPage auth={auth} setStatus={setStatusMsg} />
       case 'submission-kit': return <SubmissionKitPage auth={auth} setStatus={setStatusMsg} />
       case 'help':           return <HelpPage />
       default:               return <PluginsPage />
@@ -66,7 +66,7 @@ export default function App() {
             <button
               title="Open web dashboard"
               className="topbar-icon-btn"
-              onClick={() => window.rfApi.shell.open('http://localhost:3000')}
+              onClick={() => window.rfApi.shell.open('https://renderfarm-web.vercel.app')}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
@@ -76,7 +76,7 @@ export default function App() {
             <button
               title="Open web dashboard in browser"
               className="topbar-icon-btn"
-              onClick={() => window.rfApi.shell.open('http://localhost:3000')}
+              onClick={() => window.rfApi.shell.open('https://renderfarm-web.vercel.app')}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="10"/>

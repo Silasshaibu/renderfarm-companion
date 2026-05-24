@@ -343,7 +343,12 @@ body {
 .dl-refresh-btn   { background: transparent; border: 1px solid var(--border); border-radius: 4px; width: 28px; height: 28px; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: color 0.15s, border-color 0.15s; }
 .dl-refresh-btn:hover { color: var(--teal); border-color: var(--teal); }
 .dl-list          { flex: 1; overflow-y: auto; }
-.dl-empty         { padding: 40px; text-align: center; color: var(--muted); font-size: 13px; }
+.dl-empty           { padding: 40px; text-align: center; color: var(--muted); font-size: 13px; }
+.dl-empty--error    { color: #ef4444; }
+.dl-status--done    { color: #22c55e; }
+.dl-status--running { color: #22d3ee; }
+.dl-status--failed  { color: #ef4444; }
+.dl-status--queued  { color: #3b82f6; }
 .dl-job           { border-bottom: 1px solid var(--border); }
 .dl-job-row       { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 16px; background: transparent; border: none; cursor: pointer; text-align: left; transition: background 0.12s; }
 .dl-job-row:hover { background: rgba(255,255,255,0.025); }

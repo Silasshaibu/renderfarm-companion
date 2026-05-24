@@ -15,6 +15,10 @@ interface Window {
     shell: {
       open: (url: string) => Promise<void>
     }
+    frames: {
+      download: (outputs: string[], jobNumber: string) => Promise<{ success: boolean; count?: number; folder?: string; error?: string }>
+      onProgress: (cb: (data: { jobNumber: string; count: number; total: number }) => void) => void
+    }
     updater: {
       check:          () => Promise<string | null>
       download:       () => Promise<void>

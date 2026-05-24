@@ -27,7 +27,7 @@ autoUpdater.on('update-downloaded', () => {
 autoUpdater.on('error', (err) => {
   getMainWindow()?.webContents.send('updater:error', err.message)
 })
-const API_BASE = 'http://localhost:3001/api'
+const API_BASE = 'https://renderfarm-web.vercel.app/api'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 async function apiRequest(path: string, options: RequestInit = {}) {
@@ -109,6 +109,43 @@ app.whenReady().then(() => {
 
   ipcMain.handle('shell:open', async (_e, url: string) => {
     await shell.openExternal(url)
+  })
+
+  // ── Frame download IPC ───────────────────────────────────────────────────────
+  ipcMain.handle('frames:download', async (_e, { outputs, jobNumber }: { outputs: string[]; jobNumber: string }) => {
+    const { dialog } = await import('electron')
+    const https      = await import('https')
+    const fs         = await import('fs')
+    const path       = await import('path')
+
+    const { filePaths } = await dialog.showOpenDialog({
+      title:      'Select folder to save frames',
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (!filePaths.length) return { success: false, error: 'Cancelled' }
+
+    const folder = path.join(filePaths[0], jobNumber)
+    fs.mkdirSync(folder, { recursive: true })
+
+    let count = 0
+    for (const url of outputs) {
+      const filename = path.basename(new URL(url).pathname)
+      const dest     = path.join(folder, filename)
+
+      await new Promise<void>((resolve, reject) => {
+        const file = fs.createWriteStream(dest)
+        https.get(url, (res) => {
+          res.pipe(file)
+          file.on('finish', () => { file.close(); resolve() })
+        }).on('error', (err) => { fs.unlink(dest, () => {}); reject(err) })
+      })
+
+      count++
+      // Send live progress back to renderer
+      getMainWindow()?.webContents.send('frames:progress', { jobNumber, count, total: outputs.length })
+    }
+
+    return { success: true, count, folder }
   })
 
   // ── Updater IPC ─────────────────────────────────────────────────────────────
