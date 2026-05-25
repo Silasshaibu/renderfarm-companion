@@ -125,6 +125,27 @@ def job_update(job_id, token, **fields):
     return _api("PATCH", f"/jobs?id={job_id}", token, fields)
 
 
+def fetch_wrangler_settings(token):
+    """Fetch the wrangler settings dict; returns {} on any error."""
+    try:
+        return _api("GET", "/wrangler-settings", token)
+    except Exception:
+        return {}
+
+
+def post_wrangler_event(job_num, wrangler, action, detail, token):
+    """Write a wrangler action event to the dashboard (best-effort)."""
+    try:
+        _api("POST", "/wrangler-events", token, {
+            "wrangler":   wrangler,
+            "job_number": str(job_num),
+            "action":     action,
+            "detail":     detail,
+        })
+    except Exception:
+        pass  # non-critical — don't interrupt the render flow
+
+
 def download_file(url, dest_path, desc=""):
     """Stream-download a file from a URL to dest_path."""
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
@@ -385,12 +406,23 @@ def render_job(job, blender_path, token):
     instance_type = manifest.get("instance_type", "CPU").upper()  # "GPU" or "CPU"
     requires_gpu  = instance_type == "GPU"
 
+    # ── Fetch wrangler settings (best-effort) ────────────────────────────────
+    ws = fetch_wrangler_settings(token)
+    max_runtime_on  = bool(ws.get("maxRuntimeOn", True))
+    max_runtime_hrs = float(ws.get("maxRuntime", 2))     # hours; default 2h
+    runtime_action  = str(ws.get("runtimeAction", "Kill"))
+
+    # Hard cap: 12 hours; minimum: 10 minutes
+    max_runtime_secs = max(600, min(43200, int(max_runtime_hrs * 3600)))
+    effective_timeout = max_runtime_secs if max_runtime_on else 7200
+
     print(f"\n{'='*60}")
     print(f"  Job  : {job_num}")
     print(f"  Title: {job.get('title', '?')}")
     print(f"  Frames: {frames}")
     print(f"  Mode : {'v7 (manifest)' if use_v7 else 'v6 (zip)'}")
     print(f"  Instance: {instance_type}")
+    print(f"  Max runtime: {max_runtime_hrs}h ({effective_timeout}s)")
     print(f"{'='*60}")
 
     # ── GPU availability check ────────────────────────────────────────────────
@@ -404,6 +436,11 @@ def render_job(job, blender_path, token):
                        worker_host=WORKER_HOSTNAME,
                        status_description=f"No GPU available on worker '{WORKER_HOSTNAME}'. "
                                           f"Waiting for a GPU-capable render node.")
+            post_wrangler_event(
+                job_num, "GPU Hold", "Job held",
+                f"No GPU available on worker '{WORKER_HOSTNAME}' — job put on hold.",
+                token,
+            )
             return
         else:
             print(f"  GPU: {', '.join(gpu['names'])} ✓")
@@ -461,13 +498,24 @@ def render_job(job, blender_path, token):
                 "--frame-end",   end,
                 "--render-anim",
             ]
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=7200,
-            )
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=effective_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                hrs = effective_timeout / 3600
+                msg = (f"Blender exceeded the {hrs:.1f}h max runtime "
+                       f"({runtime_action}) — job killed.")
+                print(f"\n  ⚠  {msg}")
+                post_wrangler_event(
+                    job_num, "Max Frame/Task Runtime", "Task killed",
+                    msg, token,
+                )
+                raise RuntimeError(msg) from exc
             all_log_lines = (proc.stdout or "").strip().splitlines()
             for line in all_log_lines[-20:]:
                 print(f"    {line}")
@@ -476,6 +524,8 @@ def render_job(job, blender_path, token):
 
         else:
             # ── Scout mode: one Blender call per specific frame ───────────────
+            # Per-frame timeout = effective_timeout / total_frames (min 10 min)
+            per_frame_timeout = max(600, effective_timeout // max(total_frames, 1))
             print(f"  [2/3] Scout render — {total_frames} frame(s): {', '.join(str(f) for f in frame_list)}")
             for fi, frame_num in enumerate(frame_list):
                 print(f"        [{fi + 1}/{total_frames}] frame {frame_num}…")
@@ -486,13 +536,22 @@ def render_job(job, blender_path, token):
                     "--render-format", "PNG",
                     "--render-frame", str(frame_num),
                 ]
-                proc = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=3600,   # 1-hour per-frame limit
-                )
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=per_frame_timeout,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    hrs = per_frame_timeout / 3600
+                    msg = (f"Frame {frame_num} exceeded {hrs:.1f}h limit — killed.")
+                    print(f"\n  ⚠  {msg}")
+                    post_wrangler_event(
+                        job_num, "Max Frame/Task Runtime", "Task killed", msg, token,
+                    )
+                    raise RuntimeError(msg) from exc
                 lines = (proc.stdout or "").strip().splitlines()
                 all_log_lines.extend(lines)
                 for line in lines[-5:]:
