@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Renderfarm Local Worker  v2.1
+Renderfarm Local Worker  v2.2
 ==============================
 Polls the Renderfarm API for queued/pending jobs, renders them with the
 local Blender installation, uploads frames back via /api/upload, and
@@ -8,21 +8,32 @@ marks the job done.
 
 Submission modes supported
 --------------------------
-  v7 (current) — assets uploaded individually with SHA-256 dedup;
-                 manifest stored in job with blob_url per asset.
-  v6 (legacy)  — single .blend zip stored in blenderFile URL.
+  v7 (current) -- assets uploaded individually with SHA-256 dedup;
+                  manifest stored in job with blob_url per asset.
+  v6 (legacy)  -- single .blend zip stored in blenderFile URL.
 
 Quick start
 -----------
-  python renderfarm_worker.py
+  python renderfarm_worker.py             # render worker (default)
+  python renderfarm_worker.py --companion # auto-download daemon
+
+Companion mode
+--------------
+  Polls for jobs in status "success", downloads every frame to the local
+  output_path recorded in the job manifest (or ~/RenderFarm/downloads/<jobNum>/
+  if the manifest path is not set), then marks the job "downloaded".
+
+  Useful when rendering on a remote/headless machine and you want frames
+  automatically pulled to your local workstation.
 
 Auth token is read from the Blender addon's .rf_token file, or set the
 RF_TOKEN environment variable manually.
 
 Environment variables
 ---------------------
-  BLENDER_PATH   Override the auto-detected Blender executable.
-  RF_TOKEN       JWT auth token (overrides .rf_token file).
+  BLENDER_PATH        Override the auto-detected Blender executable.
+  RF_TOKEN            JWT auth token (overrides .rf_token file).
+  RF_DOWNLOAD_DIR     Default download root for companion mode.
 """
 
 import os
@@ -328,6 +339,30 @@ def prepare_scene_v7(job, work_dir):
     return blend_file
 
 
+# ── Frame-range parser ────────────────────────────────────────────────────────
+def _parse_frames(frames_str):
+    """
+    Parse a frames string into a sorted list of frame numbers.
+
+      "1-100"     → [1, 2, ..., 100]   contiguous range  (is_contiguous=True)
+      "1,25,100"  → [1, 25, 100]       sparse / scout    (is_contiguous=False)
+      "50"        → [50]               single frame      (is_contiguous=True)
+
+    Returns:
+        (frame_list: list[int], is_contiguous: bool)
+    """
+    clean = frames_str.replace(" ", "")
+    if "," in clean:
+        frame_list = sorted(set(int(f) for f in clean.split(",") if f.isdigit()))
+        return frame_list, False
+    if "-" in clean:
+        parts = clean.split("-")
+        start = int(parts[0])
+        end   = int(parts[1]) if len(parts) > 1 else start
+        return list(range(start, end + 1)), True
+    return [int(clean)], True
+
+
 # ── Job rendering ─────────────────────────────────────────────────────────────
 def render_job(job, blender_path, token):
     job_id  = job["id"]
@@ -381,6 +416,12 @@ def render_job(job, blender_path, token):
                    status_description="No scene file found — blenderFile URL and manifest are both empty.")
         return
 
+    # Parse frame list FIRST — handles both "1-100" ranges and "1,25,100" scout lists
+    frame_list, is_contiguous = _parse_frames(frames)
+    total_frames = len(frame_list)
+    start = str(frame_list[0])
+    end   = str(frame_list[-1])
+
     # Mark running — record which worker picked up this job
     job_update(job_id, token,
                status="running",
@@ -388,12 +429,10 @@ def render_job(job, blender_path, token):
                status_description=f"Rendering on {WORKER_HOSTNAME}")
 
     # Create per-frame task rows with started_at = NOW()
-    # (all frames share one Blender process, so start time is approximate)
-    total_frames = int(end) - int(start) + 1
-    for fi in range(total_frames):
+    for fi, frame_num in enumerate(frame_list):
         upsert_task(job_num, fi, token,
                     status="running",
-                    frame_number=int(start) + fi,
+                    frame_number=frame_num,
                     worker_host=WORKER_HOSTNAME)
 
     with tempfile.TemporaryDirectory(prefix="rf_work_") as work_dir:
@@ -408,51 +447,70 @@ def render_job(job, blender_path, token):
         os.makedirs(output_dir, exist_ok=True)
         output_pattern = os.path.join(output_dir, "frame_####")
 
-        parts = frames.replace(" ", "").split("-")
-        start = parts[0]
-        end   = parts[-1] if len(parts) > 1 else parts[0]
+        all_log_lines = []
 
-        print(f"  [2/3] Rendering frames {start}–{end} with Blender…")
-        cmd = [
-            blender_path,
-            "--background", blend_file,
-            "--render-output", output_pattern,
-            "--render-format", "PNG",   # explicit — don't rely on scene setting
-            "--frame-start", start,
-            "--frame-end",   end,
-            "--render-anim",
-        ]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=7200,   # 2-hour safety limit
-        )
+        if is_contiguous:
+            # ── Normal mode: one Blender call for the full range ──────────────
+            print(f"  [2/3] Rendering frames {start}–{end} with Blender…")
+            cmd = [
+                blender_path,
+                "--background", blend_file,
+                "--render-output", output_pattern,
+                "--render-format", "PNG",
+                "--frame-start", start,
+                "--frame-end",   end,
+                "--render-anim",
+            ]
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=7200,
+            )
+            all_log_lines = (proc.stdout or "").strip().splitlines()
+            for line in all_log_lines[-20:]:
+                print(f"    {line}")
+            if proc.returncode != 0:
+                raise RuntimeError(f"Blender exited with code {proc.returncode}")
 
-        # Print last 20 lines of Blender output for debugging
-        blender_out = proc.stdout or ""
-        all_log_lines = blender_out.strip().splitlines()
-        for line in all_log_lines[-20:]:
-            print(f"    {line}")
+        else:
+            # ── Scout mode: one Blender call per specific frame ───────────────
+            print(f"  [2/3] Scout render — {total_frames} frame(s): {', '.join(str(f) for f in frame_list)}")
+            for fi, frame_num in enumerate(frame_list):
+                print(f"        [{fi + 1}/{total_frames}] frame {frame_num}…")
+                cmd = [
+                    blender_path,
+                    "--background", blend_file,
+                    "--render-output", output_pattern,
+                    "--render-format", "PNG",
+                    "--render-frame", str(frame_num),
+                ]
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=3600,   # 1-hour per-frame limit
+                )
+                lines = (proc.stdout or "").strip().splitlines()
+                all_log_lines.extend(lines)
+                for line in lines[-5:]:
+                    print(f"    {line}")
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Blender exited {proc.returncode} on frame {frame_num}")
 
-        # POST full Blender output to the task-log API (frame index 0)
-        # The dashboard task-log page will display these lines live.
+        # POST Blender output to task-log API (task index 0, best-effort)
         if all_log_lines:
             info_lines  = [l for l in all_log_lines
                            if not any(k in l.lower() for k in ("error", "exception", "traceback"))]
             error_lines = [l for l in all_log_lines
                            if any(k in l.lower() for k in ("error", "exception", "traceback"))]
-            # Frame index 0 = the first task row in the dashboard
-            frame_start_idx = int(start) - (int(start) if manifest.get("frame_start") else 0)
-            frame_start_idx = 0  # post to task 0 — all frames share one render process
-            post_logs(job_num, frame_start_idx, info_lines,  token, level="info")
-            post_logs(job_num, frame_start_idx, error_lines, token, level="error")
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"Blender exited with code {proc.returncode}")
+            post_logs(job_num, 0, info_lines,  token, level="info")
+            post_logs(job_num, 0, error_lines, token, level="error")
 
         # ── Upload frames ─────────────────────────────────────────────
+        # Collect rendered files in frame-number order (Blender names them frame_XXXX.*)
         frame_files = sorted(
             f for f in Path(output_dir).iterdir()
             if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
@@ -466,11 +524,12 @@ def render_job(job, blender_path, token):
         for i, frame_file in enumerate(frame_files, 1):
             url = upload_frame(str(frame_file), job_num, token)
             frame_urls.append(url)
-            frame_idx = i - 1  # 0-based
-            # Record per-frame completed_at (time of upload = proxy for render done)
+            frame_idx = i - 1  # 0-based position in this job
+            # Use the actual Blender frame number from frame_list (not start+fi)
+            actual_frame_num = frame_list[frame_idx] if frame_idx < len(frame_list) else frame_list[-1]
             upsert_task(job_num, frame_idx, token,
                         status="done",
-                        frame_number=int(start) + frame_idx,
+                        frame_number=actual_frame_num,
                         output_url=url,
                         worker_host=WORKER_HOSTNAME)
             print(f"        [{i}/{len(frame_files)}] {frame_file.name}")
@@ -484,10 +543,167 @@ def render_job(job, blender_path, token):
         print(f"\n  ✓ Job {job_num} complete — {len(frame_urls)} frames uploaded")
 
 
+# ── Companion auto-download daemon ────────────────────────────────────────────
+COMPANION_INTERVAL = 20   # seconds between polls in companion mode
+
+
+def _default_download_root():
+    """Return RF_DOWNLOAD_DIR env var, or ~/RenderFarm/downloads."""
+    env = os.environ.get("RF_DOWNLOAD_DIR", "")
+    if env:
+        return env
+    return os.path.join(str(Path.home()), "RenderFarm", "downloads")
+
+
+def companion_loop(token):
+    """
+    Companion daemon: poll for success jobs, download frames, mark downloaded.
+    Runs forever until interrupted.
+    """
+    dl_root = _default_download_root()
+    print("=" * 60)
+    print("  Renderfarm Companion  v2.2  (auto-download daemon)")
+    print("=" * 60)
+    print(f"\n  API:           {API_BASE}")
+    print(f"  Download root: {dl_root}")
+    print(f"  Polling every {COMPANION_INTERVAL}s for 'success' jobs…")
+    print()
+
+    # Track per-job retry state: { job_id: (attempts, next_retry_time) }
+    already_downloaded: set = set()
+    retry_state: dict = {}   # job_id -> {'attempts': int, 'next_retry': float}
+
+    MAX_RETRIES     = 5
+    RETRY_DELAYS    = [30, 60, 120, 300, 600]  # seconds between retries (exponential)
+
+    while True:
+        try:
+            all_jobs = jobs_list(token)
+            now = time.time()
+            success_jobs = [
+                j for j in all_jobs
+                if j.get("status") == "success"
+                and str(j.get("id", "")) not in already_downloaded
+                and now >= retry_state.get(str(j.get("id", "")), {}).get("next_retry", 0)
+            ]
+
+            if success_jobs:
+                for job in success_jobs:
+                    job_id  = str(job.get("id", ""))
+                    job_num = job.get("jobNumber") or job.get("job_number", job_id)
+                    title   = job.get("title", "Untitled")
+
+                    rs       = retry_state.get(job_id, {"attempts": 0, "next_retry": 0})
+                    attempts = rs["attempts"]
+
+                    if attempts >= MAX_RETRIES:
+                        print(f"  ! Job {job_num}: max retries reached — skipping permanently")
+                        already_downloaded.add(job_id)
+                        continue
+
+                    # Determine local output directory
+                    manifest    = job.get("manifest") or {}
+                    output_path = manifest.get("output_path", "").strip()
+                    local_dir   = output_path if output_path else os.path.join(dl_root, job_num)
+
+                    # Frame URLs stored in job.outputs[]
+                    outputs = job.get("outputs") or []
+                    if isinstance(outputs, str):
+                        try:
+                            outputs = json.loads(outputs)
+                        except Exception:
+                            outputs = []
+
+                    if not outputs:
+                        print(f"  Job {job_num} ({title}): no output URLs — skipping")
+                        already_downloaded.add(job_id)
+                        continue
+
+                    if attempts > 0:
+                        print(f"\n  Retrying job {job_num} (attempt {attempts + 1}/{MAX_RETRIES}) — {title}")
+                    else:
+                        print(f"\n  Downloading job {job_num} — {title}")
+                    print(f"    {len(outputs)} frame(s) -> {local_dir}")
+                    os.makedirs(local_dir, exist_ok=True)
+
+                    failed = 0
+                    for i, url in enumerate(outputs, 1):
+                        fname = f"frame_{i:04d}{_ext_from_url(url)}"
+                        dest  = os.path.join(local_dir, fname)
+                        # Skip frames already successfully downloaded
+                        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                            print(f"    [{i}/{len(outputs)}] {fname}  (already present)")
+                            continue
+                        try:
+                            download_file(url, dest, desc=f"frame {i}/{len(outputs)}")
+                            size_mb = os.path.getsize(dest) / (1024 * 1024)
+                            print(f"    [{i}/{len(outputs)}] {fname}  ({size_mb:.1f} MB)")
+                        except Exception as e:
+                            print(f"    [{i}/{len(outputs)}] ERROR: {e}")
+                            failed += 1
+
+                    if failed == 0:
+                        # Mark job as downloaded
+                        try:
+                            job_update(int(job_id), token, status="downloaded",
+                                       status_description=(
+                                           f"Downloaded {len(outputs)} frame(s) "
+                                           f"to {local_dir} via Companion"))
+                            print(f"  ✓ Job {job_num} marked 'downloaded'")
+                        except Exception as e:
+                            print(f"  ! Could not mark job {job_num} downloaded: {e}")
+                        already_downloaded.add(job_id)
+                        retry_state.pop(job_id, None)
+                    else:
+                        delay = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
+                        retry_state[job_id] = {
+                            "attempts":   attempts + 1,
+                            "next_retry": time.time() + delay,
+                        }
+                        print(f"  ! {failed} frame(s) failed — retrying in {delay}s "
+                              f"(attempt {attempts + 1}/{MAX_RETRIES})")
+            else:
+                counts = {s: sum(1 for j in all_jobs if j.get("status") == s)
+                          for s in ("running", "pending", "success", "downloaded")}
+                summary = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+                print(f"  Idle — {summary or 'no jobs'}. Next check in {COMPANION_INTERVAL}s…",
+                      end="\r")
+
+        except urllib.error.HTTPError as e:
+            print(f"\n  API error: {e.code} {e.reason}")
+        except urllib.error.URLError as e:
+            print(f"\n  Network error: {e.reason}")
+        except Exception as e:
+            print(f"\n  Unexpected error: {e}")
+
+        time.sleep(COMPANION_INTERVAL)
+
+
+def _ext_from_url(url: str) -> str:
+    """Extract the file extension from a URL, defaulting to .png."""
+    path = url.split("?")[0]           # strip query string
+    ext  = os.path.splitext(path)[1].lower()
+    return ext if ext in (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff") else ".png"
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
+    companion_mode = "--companion" in sys.argv or "-c" in sys.argv
+
+    if companion_mode:
+        token, _email = load_token()
+        if not token:
+            print("\nERROR: No auth token found.")
+            print("  Set RF_TOKEN or sign in via the Blender addon first.")
+            sys.exit(1)
+        try:
+            companion_loop(token)
+        except KeyboardInterrupt:
+            print("\n\n  Companion stopped.")
+        return
+
     print("=" * 60)
-    print("  Renderfarm Local Worker  v2.0  (supports v6 + v7 jobs)")
+    print("  Renderfarm Local Worker  v2.2  (supports v6 + v7 jobs)")
     print("=" * 60)
 
     token, email = load_token()
