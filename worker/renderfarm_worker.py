@@ -53,11 +53,12 @@ from pathlib import Path
 WORKER_HOSTNAME = socket.gethostname()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_BASE      = "https://renderfarm-web.vercel.app/api"
+API_BASE      = os.environ.get("RF_API_BASE", "https://renderfarm.swade-art.com/api")
 POLL_INTERVAL = 15   # seconds between polls when idle
 
 # Common Windows Blender installation paths (newest first)
 BLENDER_SEARCH_PATHS = [
+    r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
     r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
     r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
     r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
@@ -270,13 +271,32 @@ def find_blender():
 # ── Scene preparation: v6 (zip) ───────────────────────────────────────────────
 def prepare_scene_v6(job, work_dir):
     """
-    Legacy v6 mode: job.blenderFile is a zip URL.
-    Downloads the zip and extracts it into work_dir.
+    Legacy v6 mode: job.blenderFile is either a URL (zip) or a local file path.
+    - Local .blend path  → use it directly (worker on same machine as submitter)
+    - Local .zip path    → extract it into work_dir
+    - Remote URL         → download zip, then extract
     Returns the absolute path to the .blend file.
     """
     blend_url = job.get("blenderFile") or job.get("blender_file", "")
-    zip_path  = os.path.join(work_dir, "scene.zip")
 
+    # ── Local file path (C:\... or /path/to/file) ─────────────────────────────
+    if os.path.isabs(blend_url) or (len(blend_url) > 1 and blend_url[1] == ':'):
+        if blend_url.lower().endswith(".blend") and os.path.isfile(blend_url):
+            print(f"  [1/3] Using local .blend directly: {blend_url}")
+            return blend_url
+        elif blend_url.lower().endswith(".zip") and os.path.isfile(blend_url):
+            print(f"  [1/3] Extracting local zip: {blend_url}")
+            with zipfile.ZipFile(blend_url) as z:
+                z.extractall(work_dir)
+            blend_files = list(Path(work_dir).glob("**/*.blend"))
+            if not blend_files:
+                raise RuntimeError("No .blend file found in local zip")
+            return str(blend_files[0])
+        else:
+            raise RuntimeError(f"Local file not found: {blend_url}")
+
+    # ── Remote URL → download zip ─────────────────────────────────────────────
+    zip_path = os.path.join(work_dir, "scene.zip")
     print("  [1/3] Downloading scene zip…  (v6 mode)")
     download_file(blend_url, zip_path, "scene.zip")
     size_mb = os.path.getsize(zip_path) / (1024 * 1024)

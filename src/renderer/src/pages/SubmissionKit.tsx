@@ -8,6 +8,15 @@ const INSTANCE_OPTIONS = [
   '16 core, 64GB Mem', '32 core, 128GB Mem',
 ]
 
+// Maps instance dropdown labels → GCP machine type strings
+const GCP_MACHINE_TYPES: Record<string, string> = {
+  '2 core, 8GB Mem':    'n1-standard-2',
+  '4 core, 16GB Mem':   'n1-standard-4',
+  '8 core, 32GB Mem':   'n1-standard-8',
+  '16 core, 64GB Mem':  'n1-standard-16',
+  '32 core, 128GB Mem': 'n1-standard-32',
+}
+
 const SOFTWARE_PACKAGES: { id: string; versions: string[] }[] = [
   { id: 'SSGI_addon-blender',      versions: ['1.0.0', '1.1.0'] },
   { id: 'animation_nodes-blender', versions: ['2.1.7', '2.2.0'] },
@@ -42,16 +51,44 @@ interface Project { id: string; name: string; isActive: boolean }
 interface EnvRow   { id: string; key: string; value: string }
 interface Props    { auth: AuthState; setStatus: (s: string) => void }
 
-// ── Shared icon components ────────────────────────────────────────────────
-function HelpIcon() {
+// ── Help icon — self-contained popover ───────────────────────────────────────
+function HelpIcon({ title, body }: { title: string; body: string | string[] }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const paragraphs = Array.isArray(body) ? body : [body]
+
   return (
-    <button type="button" className="sk-help-btn" title="Help" tabIndex={-1}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-        <circle cx="12" cy="12" r="10"/>
-        <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
-        <line x1="12" y1="17" x2="12.01" y2="17" strokeWidth="3"/>
-      </svg>
-    </button>
+    <div ref={ref} className="sk-help-wrap">
+      <button
+        type="button"
+        className={`sk-help-btn ${open ? 'sk-help-btn--open' : ''}`}
+        title={title}
+        onClick={() => setOpen(o => !o)}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+          <line x1="12" y1="17" x2="12.01" y2="17" strokeWidth="3"/>
+        </svg>
+      </button>
+
+      {open && (
+        <div className="sk-help-popover" role="tooltip">
+          <p className="sk-help-popover-title">{title}</p>
+          {paragraphs.map((p, i) => <p key={i} className="sk-help-popover-body">{p}</p>)}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -137,7 +174,11 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
   const [submitting,     setSubmitting]    = useState(false)
   const [submitted,      setSubmitted]     = useState<string | null>(null)
   const [menuOpen,       setMenuOpen]      = useState(false)
+  const [currentFile,    setCurrentFile]   = useState<string | null>(null)  // path of loaded/saved .json
   const menuRef = useRef<HTMLDivElement>(null)
+
+  // Provider — which cloud backend to submit to
+  const [provider,       setProvider]      = useState<'renderfarm' | 'gcp'>('renderfarm')
 
   // GENERAL fields
   const [jobTitle,       setJobTitle]      = useState('')
@@ -191,12 +232,17 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
   // Derived
   const softwarePkg   = SOFTWARE_PACKAGES.find((p) => p.id === softwareName)
   const softwareLabel = softwareName && softwareVersion ? `${softwareName}:${softwareVersion}` : ''
-  const canSubmit     = Boolean(jobTitle.trim() && projectId)
+  // GCP also requires a .blend file to have been selected
+  const canSubmit     = Boolean(
+    jobTitle.trim() && projectId &&
+    (provider !== 'gcp' || uploadPaths.length > 0)
+  )
 
   // Build preview payload
   const previewJson = useMemo(() => {
     const coreCount = parseInt(instance.split(' ')[0]) || 4
     const payload = {
+      provider:             provider,
       job_title:            jobTitle || '',
       project:              projects.find((p) => p.id === projectId)?.name ?? '',
       instance_type:        instance,
@@ -209,6 +255,7 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
       environment:          Object.fromEntries(envRows.filter((r) => r.key).map((r) => [r.key, r.value])),
       upload_paths:         uploadPaths,
       scout_frames:         scoutOn ? scoutFrames : null,
+      tiles:                tilesOn ? tilesVal : null,
       gpu_enabled:          gpuEnabled,
       cores:                coreCount,
       tasks_data:           taskTemplate
@@ -216,35 +263,200 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
         : { errors: ['Invalid task template. Task commands cannot be empty.'] },
     }
     return JSON.stringify(payload, null, 2)
-  }, [jobTitle, projectId, projects, instance, softwareLabel, retries, outputFolder, envRows, uploadPaths, scoutOn, scoutFrames, gpuEnabled, taskTemplate])
+  }, [provider, jobTitle, projectId, projects, instance, softwareLabel, retries, outputFolder, envRows, uploadPaths, scoutOn, scoutFrames, tilesOn, tilesVal, gpuEnabled, taskTemplate])
 
   const handleSubmit = async () => {
     if (!canSubmit || submitting) return
     setSubmitting(true)
     try {
-      const job = await window.rfApi.jobs.create(auth.token, {
-        title: jobTitle.trim(), software: softwareLabel, cores: 4,
-        gpuCount: gpuEnabled ? 1 : 0, projectId,
-      })
-      setSubmitted(job.jobNumber)
-      setSaved(true)
-      setStatus(`Job ${job.jobNumber} submitted — queued`)
-    } catch {
-      setStatus('Job submission failed')
+      if (provider === 'gcp') {
+        // Register upload-progress listener before the call (fires via IPC push)
+        window.rfApi.gcp.onUploadProgress((pct) => {
+          setStatus(`Uploading .blend file… ${pct}%`)
+        })
+        const machineType = GCP_MACHINE_TYPES[instance] ?? 'n1-standard-4'
+        setStatus('Uploading .blend file…')
+        const job = await window.rfApi.gcp.submit({
+          token:         auth.token,
+          blendFilePath: uploadPaths[0],
+          title:         jobTitle.trim(),
+          frames,
+          software:      softwareLabel || 'blender',
+          outputFolder,
+          machineType,
+          preemptible:   true,
+          projectId,
+        })
+        setSubmitted(job.jobNumber)
+        setSaved(true)
+        setStatus(`Job ${job.jobNumber} submitted → GCP`)
+      } else {
+        const job = await window.rfApi.jobs.create(auth.token, {
+          provider,
+          title: jobTitle.trim(), software: softwareLabel, cores: 4,
+          gpuCount: gpuEnabled ? 1 : 0, projectId,
+          frames, chunkSize, tiles: tilesOn ? tilesVal : null,
+          scoutFrames: scoutOn ? scoutFrames : null,
+          outputPath: outputFolder, taskTemplate,
+        })
+        setSubmitted(job.jobNumber)
+        setSaved(true)
+        setStatus(`Job ${job.jobNumber} submitted — queued`)
+      }
+    } catch (e) {
+      setStatus(`Job submission failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
     } finally {
       setSubmitting(false)
     }
   }
 
   const doReset = () => {
+    setProvider('renderfarm')
     setJobTitle(''); setSoftwareName(''); setSoftwareVersion('')
     setFrames('1-10'); setChunkSize('1')
     setTilesVal('1-9'); setTilesOn(false); setScoutFrames('1'); setScoutOn(true)
     setPlatform('linux'); setGpuEnabled(false); setInstance('4 core, 16GB Mem')
     setRetries('1'); setOutputFolder('/tmp/renders'); setTaskTemplate('')
     setUploadPaths([]); setSelectedPaths(new Set()); setEnvRows([])
-    setSaved(false); setSubmitted(null)
+    setSaved(false); setSubmitted(null); setCurrentFile(null)
     setStatus('Submission reset')
+  }
+
+  // ── Serialise current state → JSON string ─────────────────────────────────
+  const serialise = () => JSON.stringify({
+    provider,
+    jobTitle, projectId, frames, chunkSize, tilesVal, tilesOn,
+    scoutFrames, scoutOn, platform, gpuEnabled, instance, retries,
+    outputFolder, taskTemplate, softwareName, softwareVersion,
+    uploadPaths, envRows,
+  }, null, 2)
+
+  // ── Deserialise a JSON string → repopulate all fields ─────────────────────
+  const deserialise = (raw: string) => {
+    try {
+      const d = JSON.parse(raw)
+      if (d.provider         !== undefined) setProvider(d.provider)
+      if (d.jobTitle         !== undefined) setJobTitle(d.jobTitle)
+      if (d.projectId        !== undefined) setProjectId(d.projectId)
+      if (d.frames           !== undefined) setFrames(d.frames)
+      if (d.chunkSize        !== undefined) setChunkSize(d.chunkSize)
+      if (d.tilesVal         !== undefined) setTilesVal(d.tilesVal)
+      if (d.tilesOn          !== undefined) setTilesOn(d.tilesOn)
+      if (d.scoutFrames      !== undefined) setScoutFrames(d.scoutFrames)
+      if (d.scoutOn          !== undefined) setScoutOn(d.scoutOn)
+      if (d.platform         !== undefined) setPlatform(d.platform)
+      if (d.gpuEnabled       !== undefined) setGpuEnabled(d.gpuEnabled)
+      if (d.instance         !== undefined) setInstance(d.instance)
+      if (d.retries          !== undefined) setRetries(d.retries)
+      if (d.outputFolder     !== undefined) setOutputFolder(d.outputFolder)
+      if (d.taskTemplate     !== undefined) setTaskTemplate(d.taskTemplate)
+      if (d.softwareName     !== undefined) setSoftwareName(d.softwareName)
+      if (d.softwareVersion  !== undefined) setSoftwareVersion(d.softwareVersion)
+      if (d.uploadPaths      !== undefined) setUploadPaths(d.uploadPaths)
+      if (d.envRows          !== undefined) setEnvRows(d.envRows)
+      setSaved(true); setSubmitted(null)
+    } catch {
+      setStatus('Error: could not parse submission file')
+    }
+  }
+
+  // ── Load ──────────────────────────────────────────────────────────────────
+  const doLoad = async () => {
+    const result = await window.rfApi.submission.load()
+    if (!result) return
+    deserialise(result.content)
+    setCurrentFile(result.filePath)
+    setStatus(`Loaded: ${result.filePath}`)
+  }
+
+  // ── Save (overwrite current file) ─────────────────────────────────────────
+  const doSave = async () => {
+    if (!currentFile) return
+    await window.rfApi.submission.save(currentFile, serialise())
+    setSaved(true)
+    setStatus(`Saved: ${currentFile}`)
+  }
+
+  // ── Save As ───────────────────────────────────────────────────────────────
+  const doSaveAs = async () => {
+    const name = (jobTitle.trim() || 'submission').replace(/[^a-z0-9_-]/gi, '_')
+    const result = await window.rfApi.submission.saveAs(serialise(), `${name}.json`)
+    if (!result) return
+    setCurrentFile(result.filePath)
+    setSaved(true)
+    setStatus(`Saved: ${result.filePath}`)
+  }
+
+  // ── Load Blender BMW example ───────────────────────────────────────────────
+  const doLoadBmw = () => {
+    setJobTitle('Blender_bmw')
+    setSoftwareName('blender'); setSoftwareVersion('3.6.12')
+    setFrames('1-10'); setChunkSize('1')
+    setTilesVal('1-9'); setTilesOn(false)
+    setScoutFrames('1'); setScoutOn(true)
+    setPlatform('linux'); setGpuEnabled(true)
+    setInstance('8 core, 32GB Mem'); setRetries('1')
+    setOutputFolder('/tmp/renders/bmw')
+    setTaskTemplate(
+      'blender -b <scene_file> -E CYCLES -o <output_path>/frame.#### -f <chunk_start>'
+    )
+    setUploadPaths(['/assets/bmw27.blend'])
+    setEnvRows([{ id: crypto.randomUUID(), key: 'CYCLES_DEVICE', value: 'CUDA' }])
+    setCurrentFile(null); setSaved(false); setSubmitted(null)
+    setStatus('Loaded example: Blender_bmw')
+  }
+
+  // ── Export Python Script ───────────────────────────────────────────────────
+  const doExportPython = async () => {
+    const payload = JSON.parse(previewJson)
+    const jsonContent = JSON.stringify(payload, null, 2)
+    const baseName = (jobTitle.trim() || 'submission').replace(/[^a-z0-9_-]/gi, '_')
+
+    const pyContent = `#!/usr/bin/env python3
+"""
+Renderfarm Companion — generated submission script
+Job: ${jobTitle || 'Untitled'}
+Generated: ${new Date().toISOString()}
+
+Usage:
+  1. Set your API token:  export RF_TOKEN="your_token_here"
+  2. Run:                 python ${baseName}.py
+
+Requires: requests  (pip install requests)
+"""
+import json, os, sys
+import requests
+
+TOKEN    = os.environ.get('RF_TOKEN', '')
+API_BASE = 'https://renderfarm-web.vercel.app/api'
+
+if not TOKEN:
+    sys.exit('Error: RF_TOKEN environment variable is not set.')
+
+# Load the resolved submission payload
+script_dir = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(script_dir, '${baseName}.json')) as f:
+    payload = json.load(f)
+
+# Submit the job
+response = requests.post(
+    f'{API_BASE}/jobs',
+    json=payload,
+    headers={'Authorization': f'Bearer {TOKEN}'},
+    timeout=30,
+)
+
+if response.ok:
+    data = response.json()
+    print(f"✓ Job submitted: #{data.get('jobNumber', data.get('id', '?'))}")
+else:
+    sys.exit(f'Error {response.status_code}: {response.text}')
+`
+
+    const result = await window.rfApi.submission.exportPython(jsonContent, pyContent, baseName)
+    if (!result) return
+    setStatus(`Exported: ${result.pyPath} + ${result.jsonPath}`)
+    window.rfApi.shell.openPath(result.folder)
   }
 
   const tabs: { id: Tab; label: string }[] = [
@@ -340,11 +552,19 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
               </svg>
             </button>
-            <button type="button" className="sk-tb-btn sk-tb-btn--primary" title="Add files"
-              onClick={() => {
-                const fake = `/assets/scene_${Date.now()}.blend`
-                setUploadPaths((p) => [...p, fake])
-                setStatus(`Added: ${fake}`)
+            <button type="button" className="sk-tb-btn sk-tb-btn--primary"
+              title={provider === 'gcp' ? 'Select .blend file' : 'Add files'}
+              onClick={async () => {
+                if (provider === 'gcp') {
+                  const filePath = await window.rfApi.dialog.pickFile('Select .blend file', ['blend'])
+                  if (!filePath) return
+                  setUploadPaths([filePath])   // GCP: one scene file only
+                  setStatus(`Selected: ${filePath}`)
+                } else {
+                  const fake = `/assets/scene_${Date.now()}.blend`
+                  setUploadPaths((p) => [...p, fake])
+                  setStatus(`Added: ${fake}`)
+                }
               }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -366,7 +586,10 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
               <input className="sk-input" type="text" value={jobTitle}
                 onChange={(e) => { setJobTitle(e.target.value); setSaved(false) }}
                 placeholder="e.g. Shot_042 Beauty Pass" />
-              <HelpIcon />
+              <HelpIcon
+                title="Job Title"
+                body="A human-readable name for this submission — shows up in the Jobs column on the web dashboard and has no effect on rendering. Use descriptive names like Shot_042_Beauty_v03 to identify jobs at a glance, especially when multiple artists are submitting simultaneously."
+              />
             </div>
 
             <div className="sk-row">
@@ -376,7 +599,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
                 <option value="">Select project…</option>
                 {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
-              <HelpIcon />
+              <HelpIcon
+                title="Renderfarm Project"
+                body={[
+                  'Groups submissions under a named project for organizational and financial tracking.',
+                  'Cost limits can be set per project on the admin side. Submitting to the wrong project means costs get attributed incorrectly and your budget guardrails may not apply.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
@@ -386,15 +615,39 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
               <span className="sk-inline-label">Chunk size:</span>
               <input className="sk-input sk-input--xs" title="Chunk size" placeholder="1" value={chunkSize}
                 onChange={(e) => setChunkSize(e.target.value)} />
-              <HelpIcon />
+              <HelpIcon
+                title="Frames & Chunk Size"
+                body={[
+                  'Frames: the range to render. Supports arithmetic progressions — e.g. 1-100, or arbitrary sets like 1,7,10-20,30-60x3,1001 1050. Every frame (or chunk) becomes one task on a cloud machine.',
+                  'Chunk Size: how many frames one machine handles per task. Increase it when renders are fast (< 5 min) to amortize spin-up overhead. Use chunk size 1 for long renders so a preemption only loses one frame. Use <chunk_start> and <chunk_end> tokens in your Task Template.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
               <span className="sk-label">Tiles:</span>
-              <input className="sk-input sk-input--short" title="Tile range" placeholder="1-9" value={tilesVal}
+              <input className="sk-input sk-input--short" title="Tile range e.g. 1-9 for a 3×3 grid" placeholder="1-9" value={tilesVal}
                 onChange={(e) => setTilesVal(e.target.value)} disabled={!tilesOn} />
-              <Toggle on={tilesOn} onChange={setTilesOn} />
-              <HelpIcon />
+              <Toggle on={tilesOn} onChange={setTilesOn} label="Tiles" />
+              {tilesOn && (() => {
+                const m = tilesVal.match(/^(\d+)-(\d+)$/)
+                const count = m ? parseInt(m[2]) - parseInt(m[1]) + 1 : NaN
+                const side  = Number.isInteger(Math.sqrt(count)) ? Math.sqrt(count) : null
+                return (
+                  <span className="sk-tiles-hint">
+                    {!isNaN(count) && count > 0
+                      ? side ? `${count} tiles (${side}×${side} grid)` : `${count} tiles`
+                      : null}
+                  </span>
+                )
+              })()}
+              <HelpIcon
+                title="Tiles (Mosaic / Matrix Rendering)"
+                body={[
+                  'Splits each frame across multiple cloud machines simultaneously. Enter a range like 1-9 for a 3×3 grid. A task is generated for every tile × every frame — so 10 frames × 9 tiles = 90 parallel tasks.',
+                  'Use the <tile> token in your Task Template to pass the tile number to your renderer\'s region/crop argument. Each machine renders its own region; you then stitch the tiles in post.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
@@ -402,7 +655,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
               <input className="sk-input sk-input--short" title="Scout frames" placeholder="1" value={scoutFrames}
                 onChange={(e) => setScoutFrames(e.target.value)} disabled={!scoutOn} />
               <Toggle on={scoutOn} onChange={setScoutOn} />
-              <HelpIcon />
+              <HelpIcon
+                title="Scout Frames"
+                body={[
+                  'A safety mechanism — renders a subset of frames first, then holds all others. Only scout tasks start immediately; the rest wait in a holding state.',
+                  'Use this to verify render quality before committing the full job cost. If the scout frame reveals a broken texture or wrong camera, kill the job before paying for the rest.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
@@ -419,7 +678,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
               </label>
               <span className="sk-inline-label sk-inline-label--gap">GPU enabled:</span>
               <Toggle on={gpuEnabled} onChange={setGpuEnabled} />
-              <HelpIcon />
+              <HelpIcon
+                title="Cloud Platform & GPU"
+                body={[
+                  'Selects the OS and GPU availability of cloud instances. Linux is standard and most cost-effective. Windows is available for software that requires it (e.g. certain 3ds Max configurations).',
+                  'GPU enabled adds GPU hardware — required for GPU renderers like Redshift, Octane, or GPU-accelerated Arnold, but significantly more expensive. Enabling GPU when not needed wastes budget; forgetting it when needed causes renders to fail or fall back to slow CPU mode.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
@@ -432,7 +697,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
               <input className="sk-input sk-input--xs" type="number" min={0} max={5}
                 title="Retry count" placeholder="1"
                 value={retries} onChange={(e) => setRetries(e.target.value)} />
-              <HelpIcon />
+              <HelpIcon
+                title="Instance Type & Retries"
+                body={[
+                  'Instance Type: the hardware spec of each cloud machine. Too small → tasks fail from out-of-memory (render nodes have no swap). Too large → wasted cost. Run a test frame first to find the efficient minimum.',
+                  'Retries: automatically requeues a task if it fails or gets preempted by the cloud provider. Set above 0 to recover from transient failures without manual intervention.',
+                ]}
+              />
             </div>
 
             <div className="sk-row">
@@ -444,15 +715,30 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                 </svg>
               </button>
-              <HelpIcon />
+              <HelpIcon
+                title="Output Folder"
+                body={[
+                  'The path on the cloud machine where rendered files are written. All output must be below this path — files written anywhere else are lost when the instance shuts down.',
+                  'This must match exactly what your renderer\'s -o (or equivalent) argument specifies. None of your uploaded assets may exist below this path.',
+                ]}
+              />
             </div>
 
             <div className="sk-row sk-row--top">
               <span className="sk-label">Task template:</span>
               <textarea className="sk-textarea" value={taskTemplate}
                 onChange={(e) => setTaskTemplate(e.target.value)}
-                placeholder="<>" spellCheck={false} />
-              <HelpIcon />
+                placeholder={tilesOn
+                  ? 'e.g. render -frame <chunk_start> -tile <tile> -tilesX 3 -tilesY 3 -output /renders/frame.<chunk_start>.tile<tile>.exr'
+                  : 'e.g. render -frame <chunk_start>-<chunk_end> -output /renders/frame.####.exr'}
+                spellCheck={false} />
+              <HelpIcon
+                title="Task Template"
+                body={[
+                  'The actual command-line instruction that runs on every cloud machine. This is the most critical field — a wrong command means 100% task failure.',
+                  'Use tokens wrapped in angle brackets to inject per-task values: <chunk_start>, <chunk_end>, <tile>, <scene>, <output_path>. These resolve to the correct values for each individual task at runtime.',
+                ]}
+              />
             </div>
           </>
         )}
@@ -462,7 +748,10 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
           <div className="sk-files-wrap">
             {/* File list or empty state */}
             {uploadPaths.length === 0 ? (
-              <div className="sk-files-empty">No assets selected for upload.</div>
+              <div className="sk-files-empty">
+                {provider === 'gcp'
+                  ? 'No .blend file selected. Click the folder+ button above to pick your scene file.'
+                  : 'No assets selected for upload.'}</div>
             ) : (
               <div className="sk-files-list">
                 {uploadPaths.map((path, i) => (
@@ -514,7 +803,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
                 onClick={() => { setSoftwareName(''); setSoftwareVersion('') }}>
                 <TrashIcon />
               </button>
-              <HelpIcon />
+              <HelpIcon
+                title="Software Package & Version"
+                body={[
+                  'Selects the DCC application and exact version installed on the cloud machines. The version must match what your scene was saved with — rendering with a different version can cause crashes or unexpected output.',
+                  'If your required version is not listed, contact your admin to have it added to the farm.',
+                ]}
+              />
             </div>
 
             {!softwareName && (
@@ -538,7 +833,13 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
           <div className="sk-env-wrap">
             <div className="sk-env-header">
               <span className="sk-env-title">Remote environment overrides</span>
-              <HelpIcon />
+              <HelpIcon
+                title="Environment Variables"
+                body={[
+                  'Key/value pairs injected into the environment of every task process on the cloud machine. Use these to pass renderer licence paths, CUDA device flags, plugin directories, or any setting your software reads from the environment at startup.',
+                  'Variables set here override any defaults on the farm. Keys are case-sensitive. Do not store passwords or tokens here — use your project\'s secret store instead.',
+                ]}
+              />
             </div>
 
             <div className="sk-env-table">
@@ -604,7 +905,7 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
             </svg>
             Job <strong>#{submitted}</strong> submitted.{' '}
             <button type="button" className="sk-link"
-              onClick={() => window.rfApi.shell.open('http://localhost:3000/login')}>
+              onClick={() => window.rfApi.shell.open('https://renderfarm.swade-art.com')}>
               View in dashboard →
             </button>
           </div>
@@ -624,20 +925,36 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
             </svg>
           </button>
 
-          <span>{saved ? 'Submission saved' : 'This submission has not been saved'}</span>
+          <span>
+            {currentFile
+              ? saved
+                ? `Saved — ${currentFile.split(/[\\/]/).pop()}`
+                : `Unsaved changes — ${currentFile.split(/[\\/]/).pop()}`
+              : saved
+              ? 'Submission saved'
+              : 'This submission has not been saved'}
+          </span>
 
           {menuOpen && (
             <div className="sk-menu">
               <p className="sk-menu-section">SUBMISSION JSON FILES</p>
+
               <button type="button" className="sk-menu-item"
-                onClick={() => { setMenuOpen(false); setStatus('Load submission…') }}>
+                onClick={() => { setMenuOpen(false); doLoad() }}>
                 Load
               </button>
-              <button type="button" className="sk-menu-item sk-menu-item--disabled" disabled>
+
+              <button
+                type="button"
+                className={`sk-menu-item ${!currentFile ? 'sk-menu-item--disabled' : ''}`}
+                disabled={!currentFile}
+                title={!currentFile ? 'No file loaded — use Save As first' : `Save to ${currentFile}`}
+                onClick={() => { setMenuOpen(false); doSave() }}>
                 Save
               </button>
+
               <button type="button" className="sk-menu-item"
-                onClick={() => { setMenuOpen(false); setSaved(true); setStatus('Submission saved') }}>
+                onClick={() => { setMenuOpen(false); doSaveAs() }}>
                 Save As
               </button>
 
@@ -645,12 +962,7 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
 
               <p className="sk-menu-section">EXAMPLES</p>
               <button type="button" className="sk-menu-item"
-                onClick={() => {
-                  setMenuOpen(false)
-                  setJobTitle('Blender_bmw'); setSoftwareName('Blender'); setSoftwareVersion('3.1.0')
-                  setFrames('1-10'); setChunkSize('1'); setPlatform('linux')
-                  setStatus('Loaded example: Blender_bmw')
-                }}>
+                onClick={() => { setMenuOpen(false); doLoadBmw() }}>
                 Load Blender_bmw
               </button>
 
@@ -658,7 +970,7 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
 
               <p className="sk-menu-section">EXPORT</p>
               <button type="button" className="sk-menu-item"
-                onClick={() => { setMenuOpen(false); setStatus('Exporting Python script…') }}>
+                onClick={() => { setMenuOpen(false); doExportPython() }}>
                 Python Script
               </button>
 
@@ -672,10 +984,30 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
           )}
         </div>
 
-        <button type="button" className="sk-submit-btn"
-          disabled={!canSubmit || submitting} onClick={handleSubmit}>
-          {submitting ? 'SUBMITTING…' : 'SUBMIT'}
-        </button>
+        {/* Provider selector + submit */}
+        <div className="sk-bottom-right">
+          <div className="sk-provider-group" title="Select render backend">
+            <button
+              type="button"
+              className={`sk-provider-btn ${provider === 'renderfarm' ? 'sk-provider-btn--active' : ''}`}
+              onClick={() => setProvider('renderfarm')}
+            >
+              Renderfarm
+            </button>
+            <button
+              type="button"
+              className={`sk-provider-btn ${provider === 'gcp' ? 'sk-provider-btn--active' : ''}`}
+              onClick={() => setProvider('gcp')}
+            >
+              GCP
+            </button>
+          </div>
+
+          <button type="button" className="sk-submit-btn"
+            disabled={!canSubmit || submitting} onClick={handleSubmit}>
+            {submitting ? 'SUBMITTING…' : provider === 'gcp' ? 'SUBMIT → GCP' : 'SUBMIT'}
+          </button>
+        </div>
       </div>
     </div>
   )

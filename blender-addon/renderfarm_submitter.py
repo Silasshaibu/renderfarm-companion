@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 0),
+    "version":     (2, 0, 1),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -298,12 +298,24 @@ def _populate_frame_info():
     scene = bpy.context.scene
     try:
         frame_range = scene.rf_frame_range if scene.rf_use_custom_range else _get_scene_frame_range()
-        chunk       = max(1, scene.rf_chunk_size)
-        parts       = frame_range.replace(" ", "").split("-")
-        start       = int(parts[0])
-        end         = int(parts[-1]) if len(parts) > 1 else start
-        count       = max(0, end - start + 1)
-        tasks       = max(1, (count + chunk - 1) // chunk)
+        chunk  = max(1, scene.rf_chunk_size)
+        parts  = frame_range.replace(" ", "").split("-")
+        start  = int(parts[0])
+        end    = int(parts[-1]) if len(parts) > 1 else start
+        count  = max(0, end - start + 1)
+        tasks  = max(1, (count + chunk - 1) // chunk)
+
+        # Multiply by tile count when tiles are enabled
+        tile_count = 1
+        if scene.rf_use_tiles and scene.rf_tiles.strip():
+            tp = scene.rf_tiles.replace(" ", "").split("-")
+            try:
+                ts = int(tp[0]); te = int(tp[-1]) if len(tp) > 1 else ts
+                tile_count = max(1, te - ts + 1)
+            except ValueError:
+                pass
+        tasks *= tile_count
+
         scene.rf_frame_spec  = frame_range
         scene.rf_frame_count = str(count)
         scene.rf_task_count  = str(tasks)
@@ -312,6 +324,7 @@ def _populate_frame_info():
 
 def _on_chunk_updated(self, context):  _populate_frame_info()
 def _on_range_updated(self, context):  _populate_frame_info()
+def _on_tiles_updated(self, context):  _populate_frame_info()
 
 def _set_resolution(context):
     scene = context.scene
@@ -353,8 +366,9 @@ def _build_payload(context):
     env         = {v.variable_name: v.variable_value
                    for v in scene.rf_env_vars.variables if v.variable_name}
     return {
+        "provider":            scene.rf_provider,
         "title":               scene.rf_job_title,
-        "project":             scene.get("rf_project", ""),
+        "project_id":          scene.get("rf_project", ""),
         "instance_type":       scene.rf_instance_type,
         "machine_type":        scene.get("rf_machine_type", ""),
         "preemptible":         scene.rf_preemptible,
@@ -365,6 +379,8 @@ def _build_payload(context):
         "chunk_size":          scene.rf_chunk_size,
         "use_scout_frames":    scene.rf_use_scout_frames,
         "scout_frames":        scene.rf_scout_frames,
+        "use_tiles":           scene.rf_use_tiles,
+        "tiles":               scene.rf_tiles if scene.rf_use_tiles else "",
         "resolution_x":        scene.rf_resolution_x,
         "resolution_y":        scene.rf_resolution_y,
         "resolution_pct":      scene.rf_resolution_pct,
@@ -373,7 +389,7 @@ def _build_payload(context):
         "output_folder":       scene.rf_output_folder,
         "disable_audio":       scene.rf_disable_audio,
         "extra_env":           env,
-        "blender_file":        bpy.context.blend_data.filepath,
+        # blender_file intentionally omitted — the blob URL is set via manifest after upload
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -674,7 +690,9 @@ def _run_submission(scene_props, token, blend_path, payload):
         for i, dep in enumerate(uploadable):
             if _sub.get("cancel"):
                 raise InterruptedError("Cancelled")
+            print(f"[RF] Hashing dep {i}: type={dep.get('type')} name={dep.get('name')} path={dep.get('abs_path')} exists={dep.get('exists')} size={dep.get('size')}")
             sha = _sha256_file(dep["abs_path"])
+            print(f"[RF] Hash done: {sha[:16]}...")
             dep["sha256"] = sha
             with _sub_lock:
                 _sub["step_progress"] = (i + 1) / max(1, total_hash)
@@ -763,10 +781,18 @@ def _run_submission(scene_props, token, blend_path, payload):
                                          "filename": dep["name"],
                                          "size_bytes": dep["size"]},
                                         token)
-                    if resp_exists.get("exists"):
+                    if resp_exists.get("exists") and resp_exists.get("url"):
                         sha256_to_url[dep["sha256"]] = resp_exists["url"]
-                except Exception:
-                    pass
+                        print(f"[RF] Asset already on server: {dep['name']} → {resp_exists['url'][:60]}")
+                    else:
+                        # Server said not missing but can't get URL — force re-upload
+                        print(f"[RF] Asset dedup miss for {dep['name']}, adding to upload queue")
+                        missing_set.add(dep["sha256"])
+                        to_upload.append(dep)
+                except Exception as ex:
+                    print(f"[RF] WARNING: could not fetch cached URL for {dep['name']}: {ex} — forcing re-upload")
+                    missing_set.add(dep["sha256"])
+                    to_upload.append(dep)
 
         for i, dep in enumerate(to_upload):
             if _sub.get("cancel"):
@@ -1382,7 +1408,16 @@ class RF_PT_Job(_Base):
 
         layout.operator("rf.connect",        text="Connect",        icon="LINKED")
         layout.operator("rf.preview_script", text="Preview Script", icon="TEXT")
-        layout.operator("rf.submit",         text="Submit",         icon="RENDER_STILL")
+
+        # ── Provider selector ─────────────────────────────────────────────
+        layout.separator()
+        row = layout.row(align=True)
+        row.label(text="Provider:")
+        row.prop(scene, "rf_provider", text="", expand=True)
+        layout.separator()
+
+        submit_label = "Submit to GCP" if scene.rf_provider == "gcp" else "Submit"
+        layout.operator("rf.submit", text=submit_label, icon="RENDER_STILL")
 
         if scene.rf_status_msg:
             row  = layout.row()
@@ -1429,6 +1464,23 @@ class RF_PT_Frames(_Base):
             layout.row(align=True).prop(scene, "rf_frame_range", text="Custom Range")
         layout.prop(scene, "rf_use_scout_frames", text="Use Scout Frames")
         layout.row(align=True).prop(scene, "rf_scout_frames", text="Scout Frames")
+
+        # ── Tiles (Mosaic Rendering) ───────────────────────────────────────────
+        layout.separator()
+        layout.prop(scene, "rf_use_tiles", text="Tiled (Mosaic) Rendering")
+        if scene.rf_use_tiles:
+            layout.row(align=True).prop(scene, "rf_tiles", text="Tiles")
+            # Inline grid hint: "9 tiles (3×3 grid)"
+            try:
+                import math
+                tp = scene.rf_tiles.replace(" ", "").split("-")
+                ts = int(tp[0]); te = int(tp[-1]) if len(tp) > 1 else ts
+                tc = max(1, te - ts + 1)
+                sq = int(math.isqrt(tc))
+                hint = f"{tc} tiles ({sq}×{sq} grid)" if sq * sq == tc else f"{tc} tiles"
+                layout.label(text=hint, icon="MESH_GRID")
+            except Exception:
+                pass
 
 class RF_PT_FrameInfo(_Base):
     bl_label = "Frame Info"; bl_idname = "RF_PT_frame_info"
@@ -1525,6 +1577,15 @@ def register():
 
     S = bpy.types.Scene
     S.rf_job_title             = bpy.props.StringProperty(name="Job Title", default="Blender Linux Render")
+    S.rf_provider              = bpy.props.EnumProperty(
+        name="Provider",
+        description="Cloud backend to submit this job to",
+        items=[
+            ("renderfarm", "Renderfarm", "Submit to the Renderfarm cloud backend"),
+            ("gcp",        "GCP",        "Submit to Google Cloud Platform rendering"),
+        ],
+        default="renderfarm",
+    )
     S.rf_project               = bpy.props.EnumProperty(name="Project", items=[("none","— click Connect —","")])
     S.rf_instance_type         = bpy.props.EnumProperty(name="Instance Type", items=[("GPU","GPU",""),("CPU","CPU","")], update=_update_instance_type)
     S.rf_machine_type          = bpy.props.EnumProperty(name="Machine Type", items=INSTANCE_TYPES["GPU"])
@@ -1542,6 +1603,18 @@ def register():
     S.rf_frame_range           = bpy.props.StringProperty(name="Custom Range", default="1-100", update=_on_range_updated)
     S.rf_use_scout_frames      = bpy.props.BoolProperty(name="Use Scout Frames", default=True)
     S.rf_scout_frames          = bpy.props.StringProperty(name="Scout Frames", default="fml:3")
+    S.rf_use_tiles             = bpy.props.BoolProperty(
+        name="Tiled Rendering",
+        description="Split each frame across multiple cloud machines (mosaic rendering). Enter a range like 1-9 for a 3×3 grid.",
+        default=False,
+        update=_on_tiles_updated,
+    )
+    S.rf_tiles                 = bpy.props.StringProperty(
+        name="Tiles",
+        description="Tile range e.g. 1-9 for a 3×3 grid, 1-16 for 4×4. Each tile renders on its own cloud machine.",
+        default="1-9",
+        update=_on_tiles_updated,
+    )
     S.rf_frame_spec            = bpy.props.StringProperty(name="Frame Spec",  default="")
     S.rf_frame_count           = bpy.props.StringProperty(name="Frame Count", default="")
     S.rf_task_count            = bpy.props.StringProperty(name="Task Count",  default="")
@@ -1579,6 +1652,7 @@ def unregister():
         "rf_frame_spec","rf_frame_count","rf_task_count","rf_output_folder","rf_disable_audio",
         "rf_update_camera_per_frame","rf_render_all_view_layers","rf_status_msg","rf_status_type",
         "rf_extra_files","rf_extra_dirs","rf_env_vars","rf_addon_props",
+        "rf_use_tiles","rf_tiles","rf_provider",
     ]
     for p in props:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)

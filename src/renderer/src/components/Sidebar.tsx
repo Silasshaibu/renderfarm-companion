@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { Page } from '../App'
 
 type UpdateState = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'error'
@@ -62,6 +62,12 @@ export default function Sidebar({ activePage, onNavigate, onLogout, user }: Prop
   const [updateState,   setUpdateState]   = useState<UpdateState>('idle')
   const [updateVersion, setUpdateVersion] = useState<string>('')
   const [dlProgress,    setDlProgress]    = useState(0)
+  const [userMenuOpen,  setUserMenuOpen]  = useState(false)
+  const progressBarRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    progressBarRef.current?.style.setProperty('--pct', `${dlProgress}%`)
+  }, [dlProgress])
 
   // Register push-event listeners once on mount
   useEffect(() => {
@@ -113,17 +119,40 @@ export default function Sidebar({ activePage, onNavigate, onLogout, user }: Prop
         <span className="sidebar-brand-text">Renderfarm</span>
       </div>
 
-      {/* User row */}
-      <button type="button" className="sidebar-user-row" onClick={onLogout} title="Click to sign out">
-        <div className="sidebar-avatar">
-          {user.email.charAt(0).toUpperCase()}
-        </div>
-        <div className="sidebar-user-info">
+      {/* User row — caret opens dropdown */}
+      <div className="sidebar-user-wrap">
+        <div className="sidebar-user-row">
+          <div className="sidebar-avatar">
+            {user.email.charAt(0).toUpperCase()}
+          </div>
           <span className="sidebar-user-email">{user.email}</span>
-          <span className="sidebar-sign-out">Sign out</span>
+          <button
+            type="button"
+            className={`sidebar-user-caret ${userMenuOpen ? 'sidebar-user-caret--open' : ''}`}
+            title="Account options"
+            onClick={() => setUserMenuOpen(o => !o)}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
         </div>
-        <IconSignIn />
-      </button>
+
+        {userMenuOpen && (
+          <div className="sidebar-user-menu">
+            <div className="sidebar-user-menu-email">{user.email}</div>
+            <button
+              type="button"
+              className="sidebar-user-menu-item"
+              onClick={() => { setUserMenuOpen(false); onLogout() }}
+            >
+              <IconSignIn />
+              Sign out
+            </button>
+          </div>
+        )}
+      </div>
 
       {/* Nav */}
       <nav className="sidebar-nav">
@@ -144,7 +173,7 @@ export default function Sidebar({ activePage, onNavigate, onLogout, user }: Prop
         <button
           type="button"
           className="sidebar-nav-item"
-          onClick={() => window.rfApi.shell.open('http://localhost:3000/login')}
+          onClick={() => window.rfApi.shell.open('https://renderfarm.swade-art.com')}
         >
           <span className="sidebar-nav-icon"><IconDashboard /></span>
           Web dashboard
@@ -160,12 +189,7 @@ export default function Sidebar({ activePage, onNavigate, onLogout, user }: Prop
         {/* Download progress bar — visible while downloading */}
         {updateState === 'downloading' && (
           <div className="sidebar-update-track">
-            {/* CSS var drives the width — no inline style needed */}
-            <div
-              className="sidebar-update-bar"
-              // @ts-expect-error custom CSS property
-              style={{ '--pct': `${dlProgress}%` }}
-            />
+            <div ref={progressBarRef} className="sidebar-update-bar" />
           </div>
         )}
 

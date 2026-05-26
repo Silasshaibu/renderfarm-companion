@@ -1,4 +1,44 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+
+// ── Format a list of 1-based frame numbers into a compact range string ─────────
+// e.g. [2, 5,6,7,8,9,10, 210] → "0002, 0005-0010, 0210"
+function formatFrameRanges(nums: number[]): string {
+  if (!nums.length) return ''
+  const sorted = [...nums].sort((a, b) => a - b)
+  const ranges: string[] = []
+  let start = sorted[0], end = sorted[0]
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === end + 1) {
+      end = sorted[i]
+    } else {
+      ranges.push(start === end
+        ? String(start).padStart(4, '0')
+        : `${String(start).padStart(4, '0')}-${String(end).padStart(4, '0')}`)
+      start = end = sorted[i]
+    }
+  }
+  ranges.push(start === end
+    ? String(start).padStart(4, '0')
+    : `${String(start).padStart(4, '0')}-${String(end).padStart(4, '0')}`)
+  return ranges.join(', ')
+}
+
+// ── Progress bar — sets --pct via ref to avoid inline style lint warning ──────
+function ProgressBar({ pct, active }: { pct: number; active: boolean }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    ref.current?.style.setProperty('--pct', `${pct}%`)
+  }, [pct])
+  return (
+    <div className="dl-progress-wrap">
+      <div
+        ref={ref}
+        className={`dl-progress-bar ${active ? 'dl-progress-bar--active' : 'dl-progress-bar--idle'}`}
+      />
+    </div>
+  )
+}
 import type { AuthState } from '../App'
 
 // ── Shape returned by GET /api/jobs ──────────────────────────────────────────
@@ -6,60 +46,174 @@ interface ApiJob {
   id:          string
   jobNumber:   string
   title:       string
-  status:      'queued' | 'running' | 'done' | 'failed' | 'holding' | 'uploading'
+  status:      string   // queued | pending | running | holding | uploading |
+                        // upload_pending | sync_pending | syncing | sync_failed |
+                        // success | downloaded | failed | killed | preempted
   frames:      string
   software:    string
   createdAt:   string
   outputs?:    string[]   // frame download URLs — populated by render worker
+  outputPath?: string     // local output folder set in the Blender addon
 }
 
 // ── Internal display shape ────────────────────────────────────────────────────
 interface RenderJob {
-  id:        string
-  num:       string
-  title:     string
-  date:      string
-  frames:    string
-  software:  string
-  status:    'queued' | 'running' | 'done' | 'failed' | 'holding' | 'uploading'
-  outputs?:  string[]
+  id:          string
+  num:         string
+  title:       string
+  date:        string
+  createdAt:   string   // ISO string — kept for date-based filtering
+  frames:      string
+  software:    string
+  status:      string
+  outputs?:    string[]
+  outputPath?: string
 }
 
 function mapJob(j: ApiJob): RenderJob {
   return {
-    id:       j.id,
-    num:      j.jobNumber,
-    title:    j.title,
-    date:     new Date(j.createdAt).toLocaleString('en-GB', {
+    id:         j.id,
+    num:        j.jobNumber.replace(/^RF-/i, ''),
+    title:      j.title,
+    date:       new Date(j.createdAt).toLocaleString('en-GB', {
       day: 'numeric', month: 'short', year: 'numeric',
       hour: '2-digit', minute: '2-digit',
     }),
-    frames:   j.frames,
-    software: j.software,
-    status:   j.status,
-    outputs:  j.outputs,
+    createdAt:  j.createdAt,
+    frames:     j.frames,
+    software:   j.software,
+    status:     j.status,
+    outputs:    j.outputs,
+    outputPath: j.outputPath,
   }
 }
 
-const STATUS_DOT: Record<string, string> = {
-  done:      '#22c55e',
-  running:   '#22d3ee',
-  failed:    '#ef4444',
-  queued:    '#3b82f6',
-  holding:   '#f59e0b',
-  uploading: '#a78bfa',
-}
 
 const STATUS_LABEL: Record<string, string> = {
-  done:      'Completed',
-  running:   'Running',
-  failed:    'Failed',
-  queued:    'Queued',
-  holding:   'Holding',
-  uploading: 'Uploading',
+  success:        'Completed',
+  downloaded:     'Downloaded',
+  running:        'Running',
+  syncing:        'Syncing',
+  failed:         'Failed',
+  queued:         'Queued',
+  pending:        'Pending',
+  holding:        'Holding',
+  uploading:      'Uploading',
+  upload_pending: 'Upload Pending',
+  sync_pending:   'Sync Pending',
+  sync_failed:    'Sync Failed',
+  killed:         'Killed',
+  preempted:      'Preempted',
 }
 
-const FILTER_OPTIONS = ['Last 5 jobs', 'Last 10 jobs', 'Last 25 jobs', 'Last 50 jobs', 'All jobs']
+const FILTER_OPTIONS = [
+  'Last 5 jobs',
+  'Last 10 jobs',
+  'Last 25 jobs',
+  'Last 50 jobs',
+  'Last 3 months',
+  'Last 12 months',
+  'All Time',
+]
+
+// ── Parse filter string → predicate + slice ───────────────────────────────────
+function applyFilter(jobs: RenderJob[], filter: string): RenderJob[] {
+  const f = filter.trim()
+  const now = Date.now()
+
+  // "Last N jobs"
+  const countMatch = f.match(/^last\s+(\d+)\s+jobs?$/i)
+  if (countMatch) return jobs.slice(0, parseInt(countMatch[1]))
+
+  // "Last N months"
+  const monthMatch = f.match(/^last\s+(\d+)\s+months?$/i)
+  if (monthMatch) {
+    const ms = parseInt(monthMatch[1]) * 30 * 24 * 3600 * 1000
+    return jobs.filter(j => now - new Date(j.createdAt).getTime() <= ms)
+  }
+
+  // "All Time"
+  if (/^all\s*time$/i.test(f)) return jobs
+
+  // Job-number range: "00010 to 00015"  or  "10 to 15"  or  "10 - 15"
+  const rangeMatch = f.match(/^(\d+)\s*(?:to|-)\s*(\d+)$/i)
+  if (rangeMatch) {
+    const lo = parseInt(rangeMatch[1])
+    const hi = parseInt(rangeMatch[2])
+    return jobs.filter(j => { const n = parseInt(j.num); return n >= lo && n <= hi })
+  }
+
+  // Single job number: "00012"
+  if (/^\d+$/.test(f)) {
+    const target = parseInt(f)
+    return jobs.filter(j => parseInt(j.num) === target)
+  }
+
+  // Fallback — treat as "Last 10 jobs"
+  return jobs.slice(0, 10)
+}
+
+// ── Filter combo — text input + preset dropdown ───────────────────────────────
+function FilterCombo({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  // Close on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  return (
+    <div ref={ref} className="dl-filter-wrap">
+      <div className="dl-filter-field">
+        <input
+          className="dl-filter-input"
+          aria-label="Filter jobs"
+          title="Filter jobs"
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          onFocus={() => setOpen(true)}
+          placeholder="Filter…"
+        />
+        <button
+          type="button"
+          className="dl-filter-arrow"
+          title="Show filter presets"
+          tabIndex={-1}
+          onClick={() => setOpen(o => !o)}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+      </div>
+
+      {open && (
+        <div className="dl-filter-menu" role="listbox">
+          {FILTER_OPTIONS.map(opt => (
+            <button
+              key={opt}
+              type="button"
+              role="option"
+              className={`dl-filter-item ${value === opt ? 'dl-filter-item--active' : ''}`}
+              onClick={() => { onChange(opt); setOpen(false) }}
+            >
+              {opt}
+            </button>
+          ))}
+          <div className="dl-filter-hint">
+            Or type: a job number <em>00012</em>, or a range <em>10 to 20</em>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function DownloaderPage({
@@ -69,12 +223,21 @@ export default function DownloaderPage({
   auth:      AuthState
   setStatus: (s: string) => void
 }) {
-  const [jobs,     setJobs]     = useState<RenderJob[]>([])
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState('')
-  const [search,   setSearch]   = useState('')
-  const [filter,   setFilter]   = useState('Last 10 jobs')
-  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [jobs,       setJobs]       = useState<RenderJob[]>([])
+  const [loading,    setLoading]    = useState(true)
+  const [error,      setError]      = useState('')
+  const [search,     setSearch]     = useState('')
+  const [filter,     setFilter]     = useState('Last 10 jobs')
+  const [expanded,   setExpanded]   = useState<Set<string>>(new Set())
+  // Per-job overrideable output paths and download progress
+  const [pathOverrides, setPathOverrides] = useState<Record<string, string>>({})
+  const [dlProgress,    setDlProgress]    = useState<Record<string, { count: number; total: number }>>({})
+  const [dlFailed,      setDlFailed]      = useState<Record<string, number[]>>({})   // failed frame numbers (1-based)
+  const [dlFailLog,     setDlFailLog]     = useState<string | null>(null)             // job id with open fail-log popover
+  const [dlExisting,    setDlExisting]    = useState<Record<string, number>>({})
+  const [dlActive,      setDlActive]      = useState<Set<string>>(new Set())
+  // Kebab menu open state (stores job id of open menu, or null)
+  const [kebabOpen,     setKebabOpen]     = useState<string | null>(null)
 
   // ── Fetch jobs from API ───────────────────────────────────────────────────
   const fetchJobs = useCallback(async (silent = false) => {
@@ -101,16 +264,30 @@ export default function DownloaderPage({
   }, [fetchJobs])
 
   // ── UI helpers ────────────────────────────────────────────────────────────
-  const toggle = (id: string) =>
+  const toggle = (id: string) => {
     setExpanded(s => {
       const n = new Set(s)
-      n.has(id) ? n.delete(id) : n.add(id)
+      if (n.has(id)) {
+        n.delete(id)
+      } else {
+        n.add(id)
+        // Check how many frames are already on disk when expanding
+        const job = jobs.find(j => j.id === id)
+        if (job?.outputs?.length) {
+          const folder = pathOverrides[id] !== undefined ? pathOverrides[id] : (job.outputPath ?? '')
+          if (folder) {
+            window.rfApi.frames.countExisting(folder, job.frames).then(({ existing }) => {
+              setDlExisting(e => ({ ...e, [id]: existing }))
+            })
+          }
+        }
+      }
       return n
     })
+  }
 
-  const filterCount = parseInt(filter) || jobs.length
   const visible = useMemo(() => {
-    let list = jobs.slice(0, filterCount)
+    let list = applyFilter(jobs, filter)
     if (search.trim()) {
       const q = search.toLowerCase()
       list = list.filter(j =>
@@ -119,7 +296,7 @@ export default function DownloaderPage({
       )
     }
     return list
-  }, [jobs, search, filterCount])
+  }, [jobs, search, filter])
 
   const handleRefresh = () => {
     setLoading(true)
@@ -133,21 +310,54 @@ export default function DownloaderPage({
       return
     }
 
-    setStatus(`Choosing folder for ${job.num}…`)
+    const overridePath = pathOverrides[job.id]
+    const resolvedPath = overridePath !== undefined ? overridePath : job.outputPath
+
+    setStatus(resolvedPath
+      ? `Downloading ${job.num} to ${resolvedPath}…`
+      : `Choosing folder for ${job.num}…`
+    )
+
+    setDlActive(s => { const n = new Set(s); n.add(job.id); return n })
+    setDlProgress(p => ({ ...p, [job.id]: { count: 0, total: job.outputs!.length } }))
+    setDlFailed(f => { const n = { ...f }; delete n[job.id]; return n })
 
     // Listen for per-frame progress updates
-    window.rfApi.frames.onProgress(({ count, total }) => {
-      setStatus(`Downloading ${job.num}: ${count} / ${total} frames…`)
+    window.rfApi.frames.onProgress(({ jobNumber, count, failedNums, total }) => {
+      if (jobNumber === job.num) {
+        setDlProgress(p => ({ ...p, [job.id]: { count, total } }))
+        if (failedNums?.length) setDlFailed(f => ({ ...f, [job.id]: failedNums }))
+        setStatus(`Downloading ${job.num}: ${count} / ${total} frames…`)
+      }
     })
 
-    const result = await window.rfApi.frames.download(job.outputs, job.num)
+    const result = await window.rfApi.frames.download(job.outputs, job.num, resolvedPath || undefined)
+
+    setDlActive(s => { const n = new Set(s); n.delete(job.id); return n })
 
     if (result.success) {
-      setStatus(`✓ ${result.count} frames saved to ${result.folder}`)
+      const saved     = result.count   ?? 0
+      const failNums  = result.failedNums ?? []
+      setDlProgress(p => ({ ...p, [job.id]: { count: saved, total: saved + failNums.length } }))
+      if (failNums.length) {
+        setDlFailed(f => ({ ...f, [job.id]: failNums }))
+        setStatus(`✓ ${saved} frames saved, ${failNums.length} failed — ${result.folder}`)
+      } else {
+        setDlFailed(f => { const n = { ...f }; delete n[job.id]; return n })
+        setStatus(`✓ ${saved} frames saved to ${result.folder}`)
+      }
+      // Refresh existing count so the counter updates after download
+      if (result.folder && job.outputs?.length) {
+        window.rfApi.frames.countExisting(result.folder, job.frames).then(({ existing }) => {
+          setDlExisting(e => ({ ...e, [job.id]: existing }))
+        })
+      }
     } else {
+      setDlProgress(p => { const n = { ...p }; delete n[job.id]; return n })
       setStatus(`Download cancelled or failed: ${result.error ?? 'unknown error'}`)
     }
   }
+
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -166,15 +376,10 @@ export default function DownloaderPage({
         />
 
         <div className="dl-topbar-right">
-          <select
-            className="dl-filter-select"
-            value={filter}
-            onChange={e => setFilter(e.target.value)}
-          >
-            {FILTER_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
-          </select>
+          {/* Filter combo — type a job number, range (e.g. "10 to 20"), or pick a preset */}
+          <FilterCombo value={filter} onChange={setFilter} />
 
-          <button className="dl-refresh-btn" onClick={handleRefresh} title="Refresh">
+          <button type="button" className="dl-refresh-btn" onClick={handleRefresh} title="Refresh">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
               stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
               <polyline points="23 4 23 10 17 10"/>
@@ -202,7 +407,6 @@ export default function DownloaderPage({
 
         {!loading && visible.map(job => {
           const isOpen = expanded.has(job.id)
-          const dot    = STATUS_DOT[job.status] ?? '#888'
           const label  = STATUS_LABEL[job.status] ?? job.status
 
           return (
@@ -210,9 +414,9 @@ export default function DownloaderPage({
 
               {/* Collapsed row */}
               <button
+                type="button"
                 className="dl-job-row"
-                onClick={() => toggle(job.id)}
-                aria-expanded={isOpen}
+                onClick={() => { toggle(job.id); setKebabOpen(null) }}
               >
                 <span className="dl-job-num">{job.num}</span>
 
@@ -222,11 +426,6 @@ export default function DownloaderPage({
                     <span className="dl-job-date">{job.date}</span>
                     <span className="dl-job-tag">{job.frames} frames</span>
                     <span className="dl-job-tag">{job.software}</span>
-                    <span
-                      className="dl-job-dot"
-                      style={{ background: dot }}
-                      title={label}
-                    />
                   </div>
                 </div>
 
@@ -239,66 +438,216 @@ export default function DownloaderPage({
                 </svg>
               </button>
 
-              {/* Expanded detail */}
-              {isOpen && (
-                <div className="dl-job-detail">
-                  <div className="dl-detail-grid">
-                    <div className="dl-detail-row">
-                      <span className="dl-detail-label">Software</span>
-                      <span className="dl-detail-val">{job.software}</span>
-                    </div>
-                    <div className="dl-detail-row">
-                      <span className="dl-detail-label">Frames</span>
-                      <span className="dl-detail-val">{job.frames}</span>
-                    </div>
-                    <div className="dl-detail-row">
-                      <span className="dl-detail-label">Status</span>
-                      <span
-                        className={`dl-detail-val dl-status--${job.status}`}
-                      >
-                        {label}
-                      </span>
-                    </div>
-                    {job.outputs?.length ? (
-                      <div className="dl-detail-row">
-                        <span className="dl-detail-label">Frames ready</span>
-                        <span className="dl-detail-val">{job.outputs.length}</span>
-                      </div>
-                    ) : job.status === 'done' && (
-                      <div className="dl-detail-row">
-                        <span className="dl-detail-label">Frames</span>
-                        <span className="dl-detail-val" style={{ color: '#8888aa' }}>
-                          Awaiting render worker
-                        </span>
-                      </div>
-                    )}
-                  </div>
+              {/* Expanded detail — Conductor-style */}
+              {isOpen && (() => {
+                const activePath  = pathOverrides[job.id] !== undefined
+                                      ? pathOverrides[job.id]
+                                      : (job.outputPath ?? '')
+                const prog        = dlProgress[job.id]
+                const isActive    = dlActive.has(job.id)
+                const canDownload = ['success', 'downloaded'].includes(job.status) && !!job.outputs?.length
+                const totalFrames = job.outputs?.length ?? 0
+                const existing    = dlExisting[job.id] ?? 0
+                // While downloading use live progress; before/after use existing count
+                const progCount   = prog ? prog.count : existing
+                const progTotal   = prog ? prog.total : totalFrames
+                const progPct     = progTotal > 0 ? (progCount / progTotal) * 100 : 0
+                const failNums    = dlFailed[job.id] ?? []
+                const failCount   = failNums.length
+                const isKebab     = kebabOpen === job.id
+                const isFailLog   = dlFailLog === job.id
 
-                  <button
-                    type="button"
-                    className="dl-download-btn"
-                    onClick={() => handleDownload(job)}
-                    disabled={job.status !== 'done' || !job.outputs?.length}
-                    title={
-                      job.status === 'holding'
-                        ? 'Job is on hold — click Unhold on the dashboard to release it'
-                        : job.status !== 'done'
-                        ? `Job is ${label.toLowerCase()} — cannot download yet`
-                        : !job.outputs?.length
-                        ? 'No frames yet — render worker not connected'
-                        : 'Download rendered frames to a local folder'
-                    }
-                  >
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                      stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                      <polyline points="7 10 12 15 17 10"/>
-                      <line x1="12" y1="15" x2="12" y2="3"/>
-                    </svg>
-                    {job.status === 'done' ? 'Download outputs' : label}
-                  </button>
-                </div>
-              )}
+                return (
+                  <div className="dl-job-detail">
+                    <div className="dl-output-row">
+                      {/* Output path label */}
+                      <span className="dl-output-label">Output path</span>
+
+                      {/* Path input + folder browse */}
+                      <div className="dl-output-field">
+                        <input
+                          aria-label="Output folder path"
+                          className="dl-output-input"
+                          type="text"
+                          value={activePath}
+                          placeholder="Choose output folder…"
+                          onChange={e => setPathOverrides(p => ({ ...p, [job.id]: e.target.value }))}
+                        />
+                        <button
+                          type="button"
+                          className="dl-output-browse"
+                          title="Browse for folder"
+                          onClick={async () => {
+                            const picked = await window.rfApi.dialog.pickFolder(activePath || undefined)
+                            if (picked) setPathOverrides(p => ({ ...p, [job.id]: picked }))
+                          }}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M10 4H2v16h20V6H12l-2-2z"/>
+                          </svg>
+                        </button>
+                      </div>
+
+                      {/* Progress bar */}
+                      <ProgressBar pct={progPct} active={!!prog} />
+                      <div className="dl-progress-counts">
+                        <span className="dl-progress-label">{progCount} / {progTotal}</span>
+                        {failCount > 0 && (
+                          <span className="dl-failed-label">
+                            {failCount} failed download{failCount > 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Three-dot kebab menu */}
+                      <div className="dl-kebab-wrap">
+                        <button
+                          type="button"
+                          className={`dl-kebab-btn ${isKebab ? 'dl-kebab-btn--open' : ''}`}
+                          title="More options"
+                          onClick={e => { e.stopPropagation(); setKebabOpen(isKebab ? null : job.id) }}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                            <circle cx="12" cy="5"  r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/>
+                          </svg>
+                        </button>
+
+                        {isKebab && (
+                          <div className="dl-kebab-menu" role="menu">
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="dl-kebab-item"
+                              onClick={() => { setKebabOpen(null); handleRefresh() }}
+                            >
+                              Refresh all
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="dl-kebab-item"
+                              onClick={() => {
+                                setPathOverrides(p => { const n = { ...p }; delete n[job.id]; return n })
+                                setKebabOpen(null)
+                              }}
+                            >
+                              Reset output path
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              className="dl-kebab-item"
+                              disabled={!activePath}
+                              onClick={async () => {
+                                setKebabOpen(null)
+                                if (activePath) await window.rfApi.shell.openPath(activePath)
+                              }}
+                            >
+                              View in finder
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Failed-frames log button — only when failures exist */}
+                      {failCount > 0 && (
+                        <div className="dl-faillog-wrap">
+                          <button
+                            type="button"
+                            className={`dl-faillog-btn ${isFailLog ? 'dl-faillog-btn--open' : ''}`}
+                            title="View failed frames"
+                            onClick={e => {
+                              e.stopPropagation()
+                              setDlFailLog(isFailLog ? null : job.id)
+                              setKebabOpen(null)
+                            }}
+                          >
+                            {/* Scroll / list icon */}
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                              stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                              <line x1="8"  y1="6"  x2="21" y2="6"/>
+                              <line x1="8"  y1="12" x2="21" y2="12"/>
+                              <line x1="8"  y1="18" x2="21" y2="18"/>
+                              <line x1="3"  y1="6"  x2="3.01" y2="6"  strokeWidth="3"/>
+                              <line x1="3"  y1="12" x2="3.01" y2="12" strokeWidth="3"/>
+                              <line x1="3"  y1="18" x2="3.01" y2="18" strokeWidth="3"/>
+                            </svg>
+                          </button>
+
+                          {isFailLog && (() => {
+                            const rangeText = formatFrameRanges(failNums)
+                            const saveTxt = () => {
+                              const lines = [
+                                `Failed frames for job ${job.num} — ${job.title}`,
+                                `Total failed: ${failCount}`,
+                                '',
+                                rangeText,
+                                '',
+                                'Individual frame numbers:',
+                                ...failNums.map(n => String(n).padStart(4, '0')),
+                              ].join('\n')
+                              const blob = new Blob([lines], { type: 'text/plain' })
+                              const url  = URL.createObjectURL(blob)
+                              const a    = document.createElement('a')
+                              a.href     = url
+                              a.download = `failed-frames-${job.num}.txt`
+                              a.click()
+                              URL.revokeObjectURL(url)
+                            }
+                            return (
+                              <div className="dl-faillog-popover" role="dialog">
+                                <div className="dl-faillog-header">
+                                  <span className="dl-faillog-title">
+                                    {failCount} failed frame{failCount > 1 ? 's' : ''}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="dl-faillog-save"
+                                    title="Save as .txt"
+                                    onClick={saveTxt}
+                                  >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                                      stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                      <polyline points="7 10 12 15 17 10"/>
+                                      <line x1="12" y1="15" x2="12" y2="3"/>
+                                    </svg>
+                                    Save .txt
+                                  </button>
+                                </div>
+                                <p className="dl-faillog-ranges">{rangeText}</p>
+                                <div className="dl-faillog-nums">
+                                  {failNums.map(n => (
+                                    <span key={n} className="dl-faillog-chip">
+                                      {String(n).padStart(4, '0')}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )
+                          })()}
+                        </div>
+                      )}
+
+                      {/* Download button */}
+                      <button
+                        type="button"
+                        className={`dl-download-btn ${isActive ? 'dl-download-btn--active' : ''}`}
+                        onClick={() => handleDownload(job)}
+                        disabled={!canDownload || isActive}
+                        title={
+                          !canDownload
+                            ? `Job is ${label.toLowerCase()} — cannot download yet`
+                            : isActive ? 'Download in progress…'
+                            : 'Download rendered frames'
+                        }
+                      >
+                        {isActive ? 'Downloading…' : 'DOWNLOAD'}
+                      </button>
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
           )
         })}

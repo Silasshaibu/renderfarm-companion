@@ -13,13 +13,42 @@ const api = {
     list: (token: string) => ipcRenderer.invoke('projects:list', token),
   },
   shell: {
-    open: (url: string) => ipcRenderer.invoke('shell:open', url),
+    open:     (url: string)    => ipcRenderer.invoke('shell:open', url),
+    openPath: (path: string)   => ipcRenderer.invoke('shell:openPath', path) as Promise<void>,
+  },
+  dialog: {
+    pickFolder: (defaultPath?: string) =>
+      ipcRenderer.invoke('dialog:pickFolder', defaultPath) as Promise<string | null>,
+    pickFile: (title: string, extensions: string[]) =>
+      ipcRenderer.invoke('dialog:pickFile', { title, extensions }) as Promise<string | null>,
+  },
+  gcp: {
+    submit: (params: {
+      token: string; blendFilePath: string; title: string; frames: string
+      software: string; outputFolder: string; machineType: string; preemptible: boolean
+      projectId: string
+    }) => ipcRenderer.invoke('gcp:submit', params) as Promise<{ jobNumber: string; id: string }>,
+    onUploadProgress: (cb: (pct: number) => void) =>
+      ipcRenderer.on('gcp:uploadProgress', (_e, pct) => cb(pct)),
+  },
+  submission: {
+    load: () =>
+      ipcRenderer.invoke('submission:load') as Promise<{ filePath: string; content: string } | null>,
+    save: (filePath: string, content: string) =>
+      ipcRenderer.invoke('submission:save', { filePath, content }) as Promise<{ filePath: string }>,
+    saveAs: (content: string, defaultName: string) =>
+      ipcRenderer.invoke('submission:saveAs', { content, defaultName }) as Promise<{ filePath: string } | null>,
+    exportPython: (jsonContent: string, pyContent: string, baseName: string) =>
+      ipcRenderer.invoke('submission:exportPython', { jsonContent, pyContent, baseName }) as
+        Promise<{ pyPath: string; jsonPath: string; folder: string } | null>,
   },
   frames: {
-    download: (outputs: string[], jobNumber: string) =>
-      ipcRenderer.invoke('frames:download', { outputs, jobNumber }) as
-        Promise<{ success: boolean; count?: number; folder?: string; error?: string }>,
-    onProgress: (cb: (data: { jobNumber: string; count: number; total: number }) => void) =>
+    download: (outputs: string[], jobNumber: string, outputPath?: string) =>
+      ipcRenderer.invoke('frames:download', { outputs, jobNumber, outputPath }) as
+        Promise<{ success: boolean; count?: number; failedNums?: number[]; folder?: string; error?: string }>,
+    countExisting: (folder: string, frames: string) =>
+      ipcRenderer.invoke('frames:countExisting', { folder, frames }) as Promise<{ existing: number }>,
+    onProgress: (cb: (data: { jobNumber: string; count: number; failedNums: number[]; total: number }) => void) =>
       ipcRenderer.on('frames:progress', (_e, data) => cb(data)),
   },
   updater: {
