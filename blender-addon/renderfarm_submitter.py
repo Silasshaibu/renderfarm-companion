@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 2),
+    "version":     (2, 0, 3),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -646,6 +646,59 @@ def _upload_asset(abs_path, sha256, token, filename=None, progress_cb=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GCS direct uploader (used by GCP submission path)
+# ──────────────────────────────────────────────────────────────────────────────
+def _upload_blend_to_gcs(blend_path, token, progress_cb=None):
+    """
+    Upload the .blend file directly to GCS via a signed PUT URL.
+
+    1. POST /gcp/upload-url  — API returns { uploadUrl, gcsPath }
+    2. Stream PUT to GCS     — no temp buffer; reads in 64 KB chunks
+    Returns gcs_path (the GCS object path within the bucket).
+    """
+    import time, random, string
+    filename  = os.path.basename(blend_path)
+    file_size = os.path.getsize(blend_path)
+    temp_id   = f"{int(time.time()):x}" + "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=6)
+    )
+
+    resp       = _post("/gcp/upload-url", {"jobId": temp_id, "filename": filename}, token)
+    upload_url = resp["uploadUrl"]
+    gcs_path   = resp["gcsPath"]
+
+    parsed  = urllib.parse.urlparse(upload_url)
+    ssl_ctx = ssl.create_default_context()
+    conn    = http.client.HTTPSConnection(parsed.netloc, timeout=600, context=ssl_ctx)
+    try:
+        path_qs = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        conn.putrequest("PUT", path_qs)
+        conn.putheader("Content-Type",   "application/octet-stream")
+        conn.putheader("Content-Length", str(file_size))
+        conn.endheaders()
+
+        sent = 0
+        with open(blend_path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                conn.send(chunk)
+                sent += len(chunk)
+                if progress_cb and file_size:
+                    progress_cb(sent / file_size)
+
+        resp_obj = conn.getresponse()
+        resp_obj.read()   # drain body
+        if not (200 <= resp_obj.status < 300):
+            raise RuntimeError(f"GCS upload failed: HTTP {resp_obj.status}")
+    finally:
+        conn.close()
+
+    return gcs_path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Background submission thread
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_submission(scene_props, token, blend_path, payload):
@@ -878,6 +931,110 @@ def _run_submission(scene_props, token, blend_path, payload):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GCP submission pipeline (background thread)
+# ──────────────────────────────────────────────────────────────────────────────
+def _run_gcp_submission(scene_props, token, blend_path, payload):
+    """
+    GCP-only pipeline — runs in a background daemon thread.
+
+    Step 1: Upload .blend directly to GCS (with live progress)
+    Step 2: POST /api/jobs → API auto-dispatches render VMs
+    Steps 3 + 4: instantly marked done (N/A for GCP)
+    """
+
+    def _set_step(n):
+        with _sub_lock:
+            _sub["step"] = n
+            for k in _sub["step_states"]:
+                if k < n:
+                    _sub["step_states"][k] = "done"
+                elif k == n:
+                    _sub["step_states"][k] = "active"
+                else:
+                    _sub["step_states"][k] = "pending"
+
+    try:
+        filename = os.path.basename(blend_path)
+
+        # ── Step 1: Upload .blend to GCS ─────────────────────────────────────
+        _set_step(1)
+        _log(f"Uploading {filename} to cloud storage…")
+        with _sub_lock:
+            _sub["file_total"]    = 1
+            _sub["file_idx"]      = 1
+            _sub["file_name"]     = filename
+            _sub["file_progress"] = 0.0
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        def _gcs_prog(frac):
+            with _sub_lock:
+                _sub["file_progress"] = frac
+                _sub["step_progress"] = frac
+            bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        if _sub.get("cancel"):
+            raise InterruptedError("Cancelled")
+
+        gcs_path = _upload_blend_to_gcs(blend_path, token, progress_cb=_gcs_prog)
+        _log(f"Uploaded → {gcs_path}")
+
+        with _sub_lock:
+            _sub["step_states"][1] = "done"
+            _sub["step_progress"]  = 1.0
+            _sub["file_progress"]  = 1.0
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        if _sub.get("cancel"):
+            raise InterruptedError("Cancelled")
+
+        # ── Step 2: Create job (VMs auto-dispatch inside the API) ─────────────
+        _set_step(2)
+        _log("Creating job and dispatching render VMs…")
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        submit_payload = dict(payload)
+        submit_payload["provider"]       = "gcp"
+        submit_payload["gcs_scene_path"] = gcs_path
+        # Strip renderfarm-only keys that confuse the API for GCP jobs
+        for k in ("status", "manifest", "assets_total"):
+            submit_payload.pop(k, None)
+
+        result     = _post("/jobs", submit_payload, token)
+        job_number = result.get("jobNumber", "?")
+        job_id     = result.get("id", "")
+
+        with _sub_lock:
+            _sub["job_number"]     = str(job_number)
+            _sub["job_id"]         = str(job_id)
+            _sub["step_states"][2] = "done"
+            _sub["step_states"][3] = "done"   # N/A for GCP
+            _sub["step_states"][4] = "done"   # N/A for GCP
+            _sub["step_progress"]  = 1.0
+        _log(f"Job {job_number} dispatched — VMs starting…")
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        with _sub_lock:
+            _sub["state"]    = "COMPLETE"
+            _sub["uploaded"] = 1
+            _sub["skipped"]  = 0
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+    except InterruptedError:
+        with _sub_lock:
+            _sub["state"]       = "ERROR"
+            _sub["error"]       = "Cancelled"
+            _sub["failed_step"] = _sub["step"]
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+    except Exception as e:
+        with _sub_lock:
+            _sub["state"]       = "ERROR"
+            _sub["error"]       = str(e)
+            _sub["failed_step"] = _sub["step"]
+        bpy.app.timers.register(_redraw, first_interval=0.05)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dialog draw helpers
 # ──────────────────────────────────────────────────────────────────────────────
 _TYPE_ICON = {
@@ -896,6 +1053,14 @@ _STEP_LABELS = {
     4: "Upload assets",
 }
 
+# GCP uses a 2-step pipeline — steps 3+4 are N/A and auto-completed
+_STEP_LABELS_GCP = {
+    1: "Upload .blend to cloud storage",
+    2: "Create job & dispatch VMs",
+    3: "—",
+    4: "—",
+}
+
 
 def _fmt_size(size_bytes):
     if size_bytes >= 1024 * 1024 * 1024:
@@ -907,7 +1072,44 @@ def _fmt_size(size_bytes):
     return f"{size_bytes} B"
 
 
+def _draw_gcp_preflight(layout):
+    """Simplified pre-submit screen shown for GCP jobs."""
+    blend_path = bpy.context.blend_data.filepath
+    filename   = os.path.basename(blend_path) if blend_path else "untitled.blend"
+    try:
+        size_str = _fmt_size(os.path.getsize(blend_path)) if blend_path else "?"
+    except OSError:
+        size_str = "?"
+
+    row = layout.row()
+    row.scale_y = 1.2
+    row.label(text="GCP Cloud Render", icon="WORLD")
+    layout.separator(factor=0.8)
+
+    box = layout.box()
+    col = box.column(align=True)
+    col.scale_y = 1.1
+    col.label(text=f"Scene:  {filename}  ({size_str})", icon="FILE_BLEND")
+    col.label(text="The .blend will be uploaded to cloud storage,")
+    col.label(text="then render VMs will be dispatched automatically.")
+
+    layout.separator(factor=0.8)
+    action = layout.row(align=True)
+    action.scale_y = 1.6
+    action.operator("rf.start_submission", text="Upload & Submit to GCP", icon="RENDER_STILL")
+
+    layout.separator(factor=0.3)
+    hint = layout.row()
+    hint.scale_y = 0.8
+    hint.label(text="Close button below cancels.", icon="INFO")
+
+
 def _draw_preflight(layout):
+    # GCP has its own simpler preflight
+    if _sub.get("gcp_mode"):
+        _draw_gcp_preflight(layout)
+        return
+
     deps    = _sub["deps"]
     missing = [d for d in deps if not d["exists"]]
     present = [d for d in deps if d["exists"]]
@@ -985,8 +1187,13 @@ def _draw_submitting(layout):
     row.label(text=f"Submitting {job_num}…", icon="RENDER_ANIMATION")
     layout.separator(factor=0.8)
 
-    # 4-step progress rows
-    for n in range(1, 5):
+    # Step rows — GCP shows 2 meaningful steps; renderfarm shows 4
+    gcp_mode    = _sub.get("gcp_mode", False)
+    labels      = _STEP_LABELS_GCP if gcp_mode else _STEP_LABELS
+    total_steps = 2 if gcp_mode else 4
+    upload_step = 1 if gcp_mode else 4   # which step shows the file-progress box
+
+    for n in range(1, total_steps + 1):
         state = _sub["step_states"][n]
         if state == "done":
             icon   = "CHECKMARK"
@@ -1000,13 +1207,13 @@ def _draw_submitting(layout):
 
         row = layout.row(align=True)
         row.label(text="", icon=icon)
-        row.label(text=f"Step {n}/4 — {_STEP_LABELS[n]}")
+        row.label(text=f"Step {n}/{total_steps} — {labels[n]}")
         right = row.row()
         right.alignment = "RIGHT"
         right.label(text=status)
 
-    # File upload detail (step 4 active)
-    if _sub["step_states"][4] == "active":
+    # File upload detail row (step 1 for GCP, step 4 for renderfarm)
+    if _sub["step_states"][upload_step] == "active":
         layout.separator(factor=0.6)
         detail = layout.box()
         file_idx   = _sub["file_idx"]
@@ -1056,7 +1263,10 @@ def _draw_complete(layout):
     col = box.column(align=True)
     col.scale_y = 1.15
     col.label(text=f"Job Number:  {_sub['job_number']}", icon="RENDER_STILL")
-    col.label(text=f"Uploaded {_sub['uploaded']} assets  (skipped {_sub['skipped']} already on server)")
+    if _sub.get("gcp_mode"):
+        col.label(text="1 .blend file uploaded to GCS · VMs dispatching…", icon="WORLD_DATA")
+    else:
+        col.label(text=f"Uploaded {_sub['uploaded']} assets  (skipped {_sub['skipped']} already on server)")
 
     layout.separator(factor=1.2)
     dash = layout.row()
@@ -1187,6 +1397,7 @@ class RF_OT_Submit(Operator):
             _sub["error"]       = ""
             _sub["failed_step"] = 0
             _sub["cancel"]      = False
+            _sub["gcp_mode"]    = False
 
         # Pre-flight validation
         token      = _get_token()
@@ -1203,13 +1414,21 @@ class RF_OT_Submit(Operator):
             self.report({"ERROR"}, "No active project selected. Create one in Admin → Projects first.")
             return {"CANCELLED"}
 
-        # ── Scan deps (fast — no I/O except stat) ───────────────────────────
-        deps    = _scan_deps()
-        missing = [d for d in deps if not d["exists"]]
-        with _sub_lock:
-            _sub["deps"]    = deps
-            _sub["missing"] = missing
-            _sub["state"]   = "PREFLIGHT"
+        provider = scene.get("rf_provider", "renderfarm")
+
+        if provider == "gcp":
+            # GCP path: no dep scan needed — only the .blend itself is uploaded
+            with _sub_lock:
+                _sub["gcp_mode"] = True
+                _sub["state"]    = "PREFLIGHT"
+        else:
+            # ── Scan deps (fast — no I/O except stat) ───────────────────────────
+            deps    = _scan_deps()
+            missing = [d for d in deps if not d["exists"]]
+            with _sub_lock:
+                _sub["deps"]    = deps
+                _sub["missing"] = missing
+                _sub["state"]   = "PREFLIGHT"
 
         try:
             return context.window_manager.invoke_props_dialog(
@@ -1255,15 +1474,25 @@ class RF_OT_StartSubmission(Operator):
         # Capture scene-level properties NOW before the thread starts
         payload     = _build_payload(context)
         scene_props = dict(payload)
+        provider    = scene_props.get("provider", "renderfarm")
 
         with _sub_lock:
-            _sub["state"]  = "SUBMITTING"
-            _sub["cancel"] = False
+            _sub["state"]    = "SUBMITTING"
+            _sub["cancel"]   = False
+            _sub["gcp_mode"] = (provider == "gcp")
+
+        # Branch: GCP uses a direct GCS upload path; renderfarm uses the full asset pipeline
+        if provider == "gcp":
+            run_fn   = _run_gcp_submission
+            run_args = (scene_props, token, blend_path, payload)
+        else:
+            run_fn   = _run_submission
+            run_args = (scene_props, token, blend_path, payload)
 
         # Start background thread
         t = threading.Thread(
-            target=_run_submission,
-            args=(scene_props, token, blend_path, payload),
+            target=run_fn,
+            args=run_args,
             daemon=True,
         )
         t.start()
