@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 3),
+    "version":     (2, 0, 4),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -174,8 +174,10 @@ def _on_auth_success(token, email):
     _save_token(token, email)
 
     try:
+        global _machine_type_cache
         scene    = bpy.context.scene
         projects = _get("/projects", token)
+        _machine_type_cache = _fetch_machine_types()
         _populate_project_menu(projects)
         _populate_machine_menu(scene.rf_instance_type)
         _populate_camera_menu(bpy.context)
@@ -236,21 +238,34 @@ BLENDER_VERSIONS = [
     ("blender-3-3-lts", "Blender 3.3 LTS", ""),
 ]
 
-INSTANCE_TYPES = {
-    "GPU": [
-        ("a100-80gb-1", "A100 80GB · 12 vCPU · 85 GB",  ""),
-        ("a100-40gb-1", "A100 40GB · 12 vCPU · 85 GB",  ""),
-        ("l4-1",        "L4 24GB · 8 vCPU · 32 GB",     ""),
-        ("t4-1",        "T4 16GB · 4 vCPU · 15 GB",     ""),
-        ("v100-1",      "V100 16GB · 8 vCPU · 52 GB",   ""),
-    ],
-    "CPU": [
-        ("n1-highcpu-64", "n1-highcpu-64 · 64 vCPU · 57.6 GB", ""),
-        ("n1-highcpu-32", "n1-highcpu-32 · 32 vCPU · 28.8 GB", ""),
-        ("n1-highcpu-16", "n1-highcpu-16 · 16 vCPU · 14.4 GB", ""),
-        ("n1-highcpu-8",  "n1-highcpu-8 · 8 vCPU · 7.2 GB",   ""),
-    ],
+# Fallback machine type list — used if the API is unreachable.
+# Only shows machine types that were enabled at the time this addon was built.
+# The live list is fetched from /api/machine-types on login.
+_FALLBACK_MACHINE_TYPES = {
+    "GPU": [("t4-1", "T4 16GB · 4 vCPU · 15 GB", "")],
+    "CPU": [("n1-4", "CPU · 4 vCPU · 15 GB",      "")],
 }
+
+# Cache populated on login — { "GPU": [...], "CPU": [...] }
+_machine_type_cache: dict = {}
+
+def _fetch_machine_types():
+    """Fetch enabled machine types from the API. Returns a dict keyed by instance type."""
+    try:
+        rows = _get("/machine-types")  # no auth needed
+        result: dict = {"GPU": [], "CPU": []}
+        for row in rows:
+            instance = row.get("instance", "GPU")
+            if instance not in result:
+                result[instance] = []
+            result[instance].append((row["id"], row["label"], ""))
+        # Fall back to hardcoded list for any category with no enabled types
+        for key in ("GPU", "CPU"):
+            if not result.get(key):
+                result[key] = _FALLBACK_MACHINE_TYPES.get(key, [("none", "Unavailable", "")])
+        return result
+    except Exception:
+        return _FALLBACK_MACHINE_TYPES.copy()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Populate helpers
@@ -266,10 +281,12 @@ def _populate_project_menu(projects):
     )
 
 def _populate_machine_menu(instance_type="GPU"):
-    items = INSTANCE_TYPES.get(instance_type, INSTANCE_TYPES["GPU"])
+    global _machine_type_cache
+    cache = _machine_type_cache if _machine_type_cache else _FALLBACK_MACHINE_TYPES
+    items = cache.get(instance_type) or cache.get("GPU") or [("none", "Unavailable", "")]
     bpy.types.Scene.rf_machine_type = bpy.props.EnumProperty(
         name="Machine Type",
-        description="Select the machine for your render.",
+        description="Select the machine for your render. Enabled types are managed in Admin → Machine Types.",
         items=items,
     )
 
