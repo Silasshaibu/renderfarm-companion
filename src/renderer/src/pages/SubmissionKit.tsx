@@ -219,14 +219,17 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
     return () => document.removeEventListener('mousedown', handler)
   }, [menuOpen])
 
+  const [projectsLoaded, setProjectsLoaded] = useState(false)
+
   useEffect(() => {
     window.rfApi.projects.list(auth.token)
       .then((list) => {
         const active = list.filter((p) => p.isActive)
         setProjects(active)
         if (active.length > 0) setProjectId(active[0].id)
+        setProjectsLoaded(true)
       })
-      .catch(() => {})
+      .catch(() => { setProjectsLoaded(true) })
   }, [auth.token])
 
   // Derived
@@ -574,6 +577,19 @@ else:
           </div>
         )}
       </div>
+
+      {/* ── No-project warning banner ────────────────────────────────────── */}
+      {projectsLoaded && projects.length === 0 && (
+        <div className="sk-no-project-banner">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16" strokeWidth="3"/>
+          </svg>
+          <span>
+            <strong>No active project.</strong> You must create and activate a project before submitting jobs.{' '}
+            Go to <strong>renderfarm.swade-art.com → Admin → Projects</strong> and click <em>+ New Project</em>.
+          </span>
+        </div>
+      )}
 
       {/* ── Tab content ─────────────────────────────────────────────────── */}
       <div className="sk-body">
@@ -1004,7 +1020,9 @@ else:
           </div>
 
           <button type="button" className="sk-submit-btn"
-            disabled={!canSubmit || submitting} onClick={handleSubmit}>
+            disabled={!canSubmit || submitting || projects.length === 0}
+            title={projects.length === 0 ? 'Create an active project first (Admin → Projects)' : undefined}
+            onClick={handleSubmit}>
             {submitting ? 'SUBMITTING…' : provider === 'gcp' ? 'SUBMIT → GCP' : 'SUBMIT'}
           </button>
         </div>

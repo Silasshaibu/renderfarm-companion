@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 1),
+    "version":     (2, 0, 2),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -1198,6 +1198,10 @@ class RF_OT_Submit(Operator):
         if not blend_path:
             self.report({"ERROR"}, "Please save your .blend file before submitting.")
             return {"CANCELLED"}
+        scene = context.scene
+        if scene.get("rf_project", "none") in ("none", "", None):
+            self.report({"ERROR"}, "No active project selected. Create one in Admin → Projects first.")
+            return {"CANCELLED"}
 
         # ── Scan deps (fast — no I/O except stat) ───────────────────────────
         deps    = _scan_deps()
@@ -1416,8 +1420,16 @@ class RF_PT_Job(_Base):
         row.prop(scene, "rf_provider", text="", expand=True)
         layout.separator()
 
-        submit_label = "Submit to GCP" if scene.rf_provider == "gcp" else "Submit"
-        layout.operator("rf.submit", text=submit_label, icon="RENDER_STILL")
+        # ── Project guard — block submission when no active project exists ───
+        has_project = scene.get("rf_project", "none") not in ("none", "", None)
+        if not has_project:
+            box = layout.box()
+            box.alert = True
+            box.label(text="No active project selected.", icon="ERROR")
+            box.label(text="Go to Admin → Projects and create one first.")
+        else:
+            submit_label = "Submit to GCP" if scene.rf_provider == "gcp" else "Submit"
+            layout.operator("rf.submit", text=submit_label, icon="RENDER_STILL")
 
         if scene.rf_status_msg:
             row  = layout.row()
