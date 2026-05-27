@@ -243,8 +243,8 @@ export default function DownloaderPage({
   const fetchJobs = useCallback(async (silent = false) => {
     try {
       const raw = (await window.rfApi.jobs.list(auth.token)) as ApiJob[]
-      // Newest first
-      setJobs([...raw].reverse().map(mapJob))
+      // API already returns newest first (ORDER BY created_at DESC)
+      setJobs(raw.map(mapJob))
       setError('')
       if (!silent) setStatus('Job list refreshed')
     } catch (e) {
