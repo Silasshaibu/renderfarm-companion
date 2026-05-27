@@ -2209,7 +2209,7 @@ def register():
     )
     S.rf_project               = bpy.props.EnumProperty(name="Project", items=[("none","— click Connect —","")])
     S.rf_instance_type         = bpy.props.EnumProperty(name="Instance Type", items=[("GPU","GPU",""),("CPU","CPU","")], update=_update_instance_type)
-    S.rf_machine_type          = bpy.props.EnumProperty(name="Machine Type", items=INSTANCE_TYPES["GPU"])
+    S.rf_machine_type          = bpy.props.EnumProperty(name="Machine Type", items=_FALLBACK_MACHINE_TYPES["GPU"])
     S.rf_preemptible           = bpy.props.BoolProperty(name="Preemptible", default=True)
     S.rf_preemptible_retries   = bpy.props.IntProperty(name="Preempted Retries", default=1, min=1, max=100)
     S.rf_blender_version       = bpy.props.EnumProperty(name="Blender Version", items=BLENDER_VERSIONS)
