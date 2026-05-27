@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 4),
+    "version":     (2, 0, 5),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -1663,7 +1663,7 @@ class RF_PT_Job(_Base):
         layout.separator()
         row = layout.row(align=True)
         row.label(text="Provider:")
-        row.prop(scene, "rf_provider", text="", expand=True)
+        row.prop(scene, "rf_provider", text="")
         layout.separator()
 
         # ── Project guard — block submission when no active project exists ───
