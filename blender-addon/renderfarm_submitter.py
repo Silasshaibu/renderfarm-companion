@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 9),
+    "version":     (2, 1, 0),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -271,7 +271,7 @@ def _fetch_machine_types():
 # Populate helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _populate_project_menu(projects):
-    items = [(p["id"], p["name"], "") for p in projects if p.get("isActive", True)]
+    items = [(str(p["id"]), p["name"], "") for p in projects if p.get("isActive", True)]
     if not items:
         items = [("none", "No Projects", "")]
     bpy.types.Scene.rf_project = bpy.props.EnumProperty(
@@ -516,7 +516,7 @@ def _build_payload(context):
     return {
         "provider":            scene.rf_provider,
         "title":               scene.rf_job_title,
-        "project_id":          scene.get("rf_project", ""),
+        "project_id":          scene.rf_project if scene.rf_project not in ("none", "", None) else "",
         "instance_type":       scene.rf_instance_type,
         "machine_type":        scene.get("rf_machine_type", ""),
         "preemptible":         scene.rf_preemptible,
@@ -1737,7 +1737,7 @@ class RF_OT_Submit(Operator):
             self.report({"ERROR"}, "Please save your .blend file before submitting.")
             return {"CANCELLED"}
         scene = context.scene
-        if scene.get("rf_project", "none") in ("none", "", None):
+        if scene.rf_project in ("none", "", None):
             self.report({"ERROR"}, "No active project selected. Create one in Admin → Projects first.")
             return {"CANCELLED"}
 
@@ -2017,7 +2017,7 @@ class RF_PT_Job(_Base):
         layout.separator()
 
         # ── Project guard — block submission when no active project exists ───
-        has_project = scene.get("rf_project", "none") not in ("none", "", None)
+        has_project = scene.rf_project not in ("none", "", None)
         if not has_project:
             box = layout.box()
             box.alert = True
