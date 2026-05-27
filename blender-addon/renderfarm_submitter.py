@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 5),
+    "version":     (2, 0, 6),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -311,18 +311,115 @@ def _populate_camera_menu(context):
         except Exception:
             pass
 
+def _parse_frame_spec(spec):
+    """
+    Parse a Conductor frame spec string into a sorted list of unique frame numbers.
+    Supports:
+      42            single frame
+      1-100         inclusive range
+      1-100x2       range with step
+      1,7,10-20x3   comma-separated mixed list
+    Does NOT handle fml:/auto: — those are resolved before calling this.
+    Returns [] on parse error.
+    """
+    frames = set()
+    spec = spec.replace(" ", "")
+    if not spec:
+        return []
+    for part in spec.split(","):
+        if not part:
+            continue
+        try:
+            if "x" in part:
+                range_part, step = part.rsplit("x", 1)
+                step = int(step)
+            else:
+                range_part = part
+                step = 1
+            if "-" in range_part.lstrip("-"):
+                # handle negative numbers: find the second '-' after optional leading '-'
+                stripped = range_part.lstrip("-")
+                dash_idx  = stripped.find("-")
+                if range_part.startswith("-"):
+                    start_s = "-" + stripped[:dash_idx]
+                    end_s   = stripped[dash_idx+1:]
+                else:
+                    idx     = range_part.find("-")
+                    start_s = range_part[:idx]
+                    end_s   = range_part[idx+1:]
+                start = int(start_s); end = int(end_s)
+                frames.update(range(start, end + 1, max(1, step)))
+            else:
+                frames.add(int(range_part))
+        except (ValueError, ZeroDivisionError):
+            pass
+    return sorted(frames)
+
+
+def _resolve_scout_spec(scout_expr, all_frames):
+    """
+    Resolve fml:N / auto:N shorthand or fall back to _parse_frame_spec.
+    Returns a sorted list of scout frame numbers.
+    """
+    if not scout_expr or not all_frames:
+        return []
+    expr = scout_expr.strip()
+    try:
+        if expr.lower().startswith("fml:"):
+            n = max(1, int(expr.split(":")[1]))
+            if n == 1:
+                return [all_frames[0]]
+            if n == 2:
+                return [all_frames[0], all_frames[-1]]
+            # First, middle positions, last
+            indices = [0]
+            mid_count = n - 2
+            for i in range(1, mid_count + 1):
+                idx = round(i * (len(all_frames) - 1) / (mid_count + 1))
+                indices.append(idx)
+            indices.append(len(all_frames) - 1)
+            return sorted(set(all_frames[i] for i in indices))
+        elif expr.lower().startswith("auto:"):
+            n = max(1, int(expr.split(":")[1]))
+            if n >= len(all_frames):
+                return list(all_frames)
+            indices = [round(i * (len(all_frames) - 1) / (n - 1)) for i in range(n)] if n > 1 else [0]
+            return sorted(set(all_frames[i] for i in indices))
+    except (ValueError, IndexError):
+        pass
+    # Fall back to explicit frame spec
+    explicit = _parse_frame_spec(expr)
+    return [f for f in explicit if f in set(all_frames)]
+
+
 def _populate_frame_info():
+    """
+    Recompute and write all six Frame Info read-only fields:
+      Frame Spec, Scout Spec, Frame Count, Task Count,
+      Scout Frame Count, Scout Task Count
+    Called whenever chunk size, frame range, scout frames, or tiles change.
+    """
     scene = bpy.context.scene
     try:
-        frame_range = scene.rf_frame_range if scene.rf_use_custom_range else _get_scene_frame_range()
-        chunk  = max(1, scene.rf_chunk_size)
-        parts  = frame_range.replace(" ", "").split("-")
-        start  = int(parts[0])
-        end    = int(parts[-1]) if len(parts) > 1 else start
-        count  = max(0, end - start + 1)
-        tasks  = max(1, (count + chunk - 1) // chunk)
+        import math as _math
 
-        # Multiply by tile count when tiles are enabled
+        # ── Resolve full frame list ───────────────────────────────────────────
+        frame_range = scene.rf_frame_range if scene.rf_use_custom_range else _get_scene_frame_range()
+        all_frames  = _parse_frame_spec(frame_range)
+        if not all_frames:
+            # Fallback simple parse (handles plain "1-5" before _parse_frame_spec)
+            parts = frame_range.replace(" ", "").split("-")
+            try:
+                start = int(parts[0]); end = int(parts[-1]) if len(parts) > 1 else start
+                all_frames = list(range(start, end + 1))
+            except ValueError:
+                all_frames = []
+
+        chunk = max(1, scene.rf_chunk_size)
+        count = len(all_frames)
+        tasks = max(1, _math.ceil(count / chunk)) if count else 0
+
+        # ── Tile multiplier ───────────────────────────────────────────────────
         tile_count = 1
         if scene.rf_use_tiles and scene.rf_tiles.strip():
             tp = scene.rf_tiles.replace(" ", "").split("-")
@@ -333,15 +430,49 @@ def _populate_frame_info():
                 pass
         tasks *= tile_count
 
-        scene.rf_frame_spec  = frame_range
-        scene.rf_frame_count = str(count)
-        scene.rf_task_count  = str(tasks)
+        # ── Scout frames ──────────────────────────────────────────────────────
+        scout_frames     = []
+        scout_spec_str   = ""
+        scout_frame_count = 0
+        scout_task_count  = 0
+
+        if scene.rf_use_scout_frames and scene.rf_scout_frames.strip():
+            scout_frames = _resolve_scout_spec(scene.rf_scout_frames.strip(), all_frames)
+            scout_spec_str = ",".join(str(f) for f in scout_frames)
+
+            # Scout frame count: every frame rendered in any chunk containing a scout frame
+            # (because remote nodes execute entire chunks)
+            scout_set    = set(scout_frames)
+            all_frames_s = set(all_frames)
+            affected_chunks = set()
+            for i, f in enumerate(all_frames):
+                chunk_idx = i // chunk
+                if f in scout_set:
+                    affected_chunks.add(chunk_idx)
+
+            # Count all frames in affected chunks
+            rendered_in_scout = sum(
+                1 for i, f in enumerate(all_frames) if i // chunk in affected_chunks
+            )
+            scout_frame_count = rendered_in_scout * tile_count
+            scout_task_count  = len(affected_chunks) * tile_count
+
+        # ── Write to scene properties ─────────────────────────────────────────
+        scene.rf_frame_spec        = frame_range
+        scene.rf_scout_spec        = scout_spec_str
+        scene.rf_frame_count       = str(count)
+        scene.rf_task_count        = str(tasks)
+        scene.rf_scout_frame_count = str(scout_frame_count) if scout_frame_count else ""
+        scene.rf_scout_task_count  = str(scout_task_count)  if scout_task_count  else ""
+
     except Exception:
         pass
+
 
 def _on_chunk_updated(self, context):  _populate_frame_info()
 def _on_range_updated(self, context):  _populate_frame_info()
 def _on_tiles_updated(self, context):  _populate_frame_info()
+def _on_scout_updated(self, context):  _populate_frame_info()
 
 def _set_resolution(context):
     scene = context.scene
@@ -1696,7 +1827,8 @@ class RF_PT_General(_Base):
         layout.label(text="Instance Type:");  layout.prop(scene, "rf_instance_type",     text="")
         layout.label(text="Machine Type:");   layout.prop(scene, "rf_machine_type",      text="")
         layout.prop(scene, "rf_preemptible", text="Preemptible")
-        layout.label(text="Preemptible Retries:"); layout.prop(scene, "rf_preemptible_retries", text="")
+        if scene.rf_preemptible:
+            layout.label(text="Preemptible Retries:"); layout.prop(scene, "rf_preemptible_retries", text="")
         layout.label(text="Blender Version:"); layout.prop(scene, "rf_blender_version",  text="")
         layout.label(text="Render Software:"); layout.prop(scene, "rf_render_software",  text="")
 
@@ -1721,7 +1853,8 @@ class RF_PT_Frames(_Base):
         if scene.rf_use_custom_range:
             layout.row(align=True).prop(scene, "rf_frame_range", text="Custom Range")
         layout.prop(scene, "rf_use_scout_frames", text="Use Scout Frames")
-        layout.row(align=True).prop(scene, "rf_scout_frames", text="Scout Frames")
+        if scene.rf_use_scout_frames:
+            layout.row(align=True).prop(scene, "rf_scout_frames", text="Scout Frames")
 
         # ── Tiles (Mosaic Rendering) ───────────────────────────────────────────
         layout.separator()
@@ -1746,7 +1879,18 @@ class RF_PT_FrameInfo(_Base):
 
     def draw(self, context):
         layout = self.layout; scene = context.scene
-        for prop, label in [("rf_frame_spec","Frame Spec"),("rf_frame_count","Frame Count"),("rf_task_count","Task Count")]:
+        fields = [
+            ("rf_frame_spec",        "Frame Spec"),
+            ("rf_frame_count",       "Frame Count"),
+            ("rf_task_count",        "Task Count"),
+        ]
+        if scene.rf_use_scout_frames:
+            fields += [
+                ("rf_scout_spec",        "Scout Spec"),
+                ("rf_scout_frame_count", "Scout Frame Count"),
+                ("rf_scout_task_count",  "Scout Task Count"),
+            ]
+        for prop, label in fields:
             row = layout.row(align=True); row.active = False; row.prop(scene, prop, text=label)
 
 class RF_PT_Addons(_Base):
@@ -1859,8 +2003,8 @@ def register():
     S.rf_chunk_size            = bpy.props.IntProperty(name="Chunk Size", default=1, min=1, max=800, update=_on_chunk_updated)
     S.rf_use_custom_range      = bpy.props.BoolProperty(name="Use Custom Range", default=True)
     S.rf_frame_range           = bpy.props.StringProperty(name="Custom Range", default="1-100", update=_on_range_updated)
-    S.rf_use_scout_frames      = bpy.props.BoolProperty(name="Use Scout Frames", default=True)
-    S.rf_scout_frames          = bpy.props.StringProperty(name="Scout Frames", default="fml:3")
+    S.rf_use_scout_frames      = bpy.props.BoolProperty(name="Use Scout Frames", default=True, update=_on_scout_updated)
+    S.rf_scout_frames          = bpy.props.StringProperty(name="Scout Frames", default="fml:3", update=_on_scout_updated)
     S.rf_use_tiles             = bpy.props.BoolProperty(
         name="Tiled Rendering",
         description="Split each frame across multiple cloud machines (mosaic rendering). Enter a range like 1-9 for a 3×3 grid.",
@@ -1873,9 +2017,12 @@ def register():
         default="1-9",
         update=_on_tiles_updated,
     )
-    S.rf_frame_spec            = bpy.props.StringProperty(name="Frame Spec",  default="")
-    S.rf_frame_count           = bpy.props.StringProperty(name="Frame Count", default="")
-    S.rf_task_count            = bpy.props.StringProperty(name="Task Count",  default="")
+    S.rf_frame_spec            = bpy.props.StringProperty(name="Frame Spec",        default="")
+    S.rf_scout_spec            = bpy.props.StringProperty(name="Scout Spec",        default="")
+    S.rf_frame_count           = bpy.props.StringProperty(name="Frame Count",       default="")
+    S.rf_task_count            = bpy.props.StringProperty(name="Task Count",        default="")
+    S.rf_scout_frame_count     = bpy.props.StringProperty(name="Scout Frame Count", default="")
+    S.rf_scout_task_count      = bpy.props.StringProperty(name="Scout Task Count",  default="")
     S.rf_output_folder         = bpy.props.StringProperty(name="Output Folder", default="", subtype="DIR_PATH")
     S.rf_disable_audio         = bpy.props.BoolProperty(name="Disable Audio", default=True)
     S.rf_update_camera_per_frame = bpy.props.BoolProperty(name="Update active camera every frame", default=False)
@@ -1907,7 +2054,8 @@ def unregister():
         "rf_preemptible","rf_preemptible_retries","rf_blender_version","rf_render_software",
         "rf_resolution_x","rf_resolution_y","rf_resolution_pct","rf_camera_override","rf_samples",
         "rf_chunk_size","rf_use_custom_range","rf_frame_range","rf_use_scout_frames","rf_scout_frames",
-        "rf_frame_spec","rf_frame_count","rf_task_count","rf_output_folder","rf_disable_audio",
+        "rf_frame_spec","rf_scout_spec","rf_frame_count","rf_task_count",
+        "rf_scout_frame_count","rf_scout_task_count","rf_output_folder","rf_disable_audio",
         "rf_update_camera_per_frame","rf_render_all_view_layers","rf_status_msg","rf_status_type",
         "rf_extra_files","rf_extra_dirs","rf_env_vars","rf_addon_props",
         "rf_use_tiles","rf_tiles","rf_provider",
