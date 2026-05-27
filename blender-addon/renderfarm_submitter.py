@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 8),
+    "version":     (2, 0, 9),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -1556,79 +1556,58 @@ def _draw_submitting(layout):
 
 
 def _draw_complete(layout):
-    # Header
-    row = layout.row()
-    row.scale_y = 1.2
-    row.label(text="Job Submitted Successfully", icon="CHECKMARK")
-    layout.separator(factor=0.8)
+    """
+    Conductor-style Response tab — success.
+    Single job-submitted line (top-left) + 'Go to dashboard' button (top-right).
+    The rest of the content area is empty. Footer 'Close' is the dialog's own button.
+    """
+    job_num_raw = _sub.get("job_number", "0")
+    try:
+        job_padded = str(int(job_num_raw)).zfill(5)
+    except (ValueError, TypeError):
+        job_padded = str(job_num_raw).zfill(5)
 
-    # Job summary box
+    blender_ver = _sub.get("blender_ver_str", "")
+    if not blender_ver:
+        _v = bpy.app.version
+        blender_ver = f"Blender {_v[0]}.{_v[1]}.{_v[2]}"
+
+    scene_name = os.path.splitext(
+        os.path.basename(bpy.data.filepath or "untitled.blend")
+    )[0]
+
+    job_line = f"Job submitted – {blender_ver} Linux Render {scene_name} ({job_padded})"
+
+    # ── Content area ──────────────────────────────────────────────────────────
     box = layout.box()
-    col = box.column(align=True)
-    col.scale_y = 1.15
-    col.label(text=f"Job Number:  {_sub['job_number']}", icon="RENDER_STILL")
-    if _sub.get("gcp_mode"):
-        col.label(text="1 .blend file uploaded to GCS · VMs dispatching…", icon="WORLD_DATA")
-    else:
-        col.label(text=f"Uploaded {_sub['uploaded']} assets  (skipped {_sub['skipped']} already on server)")
+    row = box.row(align=False)
+    # Job line — left aligned, no icon
+    row.label(text=job_line)
+    # 'Go to dashboard' — right aligned, outlined look via operator button
+    right = row.row()
+    right.alignment = "RIGHT"
+    right.operator("rf.open_dashboard", text="Go to dashboard")
 
-    # Frame & task info
-    frame_spec       = _sub.get("frame_spec", "")
-    frame_count      = _sub.get("frame_count", "")
-    task_count       = _sub.get("task_count", "")
-    scout_task_count = _sub.get("scout_task_count", "")
-
-    if frame_spec or frame_count or task_count:
-        layout.separator(factor=0.6)
-        info_box = layout.box()
-        info_col = info_box.column(align=True)
-        info_col.scale_y = 1.05
-        if frame_spec:
-            info_col.label(text=f"Frame Range:  {frame_spec}",   icon="SEQUENCE")
-        if frame_count:
-            info_col.label(text=f"Frame Count:  {frame_count}",  icon="RENDERLAYERS")
-        if task_count:
-            info_col.label(text=f"Task Count:   {task_count}",   icon="NETWORK_DRIVE")
-        if scout_task_count and str(scout_task_count) not in ("0", ""):
-            info_col.label(text=f"Scout Tasks:  {scout_task_count}", icon="VIEWZOOM")
-
-    layout.separator(factor=1.0)
-    dash = layout.row()
-    dash.scale_y = 1.8
-    dash.operator("rf.open_dashboard", text="Open Dashboard", icon="URL")
-
-    layout.separator(factor=0.5)
-    hint = layout.row()
-    hint.scale_y = 0.8
-    hint.label(text="Close button below dismisses this window.", icon="INFO")
+    # Empty space to fill the content area (mirrors the real Conductor dialog)
+    box.separator(factor=14.0)
 
 
 def _draw_error(layout):
-    # Header
-    row = layout.row()
-    row.scale_y = 1.2
-    row.alert = True
-    row.label(text="Submission Failed", icon="ERROR")
-    layout.separator(factor=0.8)
+    """
+    Conductor-style Response tab — failure.
+    Single red 'Submission failed' line. No dashboard button. No retry button.
+    """
+    err_text = _sub.get("error", "Unknown error")
+    # Trim to one line for the label; full text available in Blender's console
+    first_line = err_text.split("\n")[0][:200]
 
     box = layout.box()
-    box.alert = True
-    col = box.column(align=True)
-    col.scale_y = 1.1
-    err_text = _sub.get("error", "Unknown error")
-    for line in err_text[:300].split("\n")[:6]:
-        col.label(text=line or " ")
-    if _sub.get("failed_step"):
-        col.label(text=f"Failed at step {_sub['failed_step']}")
+    row = box.row()
+    row.alert = True
+    row.label(text=f"Submission failed – {first_line}")
 
-    layout.separator(factor=0.8)
-    row2 = layout.row(align=True)
-    row2.scale_y = 1.5
-    row2.operator("rf.submit", text="Retry", icon="FILE_REFRESH")
-
-    hint = layout.row()
-    hint.scale_y = 0.8
-    hint.label(text="Click Retry to try again, or Close to dismiss.", icon="INFO")
+    # Empty space to match dialog height
+    box.separator(factor=14.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1735,6 +1714,7 @@ class RF_OT_Submit(Operator):
             _sub["frame_count"]    = ""
             _sub["task_count"]     = ""
             _sub["scout_task_count"] = ""
+            _sub["blender_ver_str"]  = ""
             # Conductor 3-bar fields
             _sub["sub_status"]         = "idle"
             _sub["md5_total"]          = 0
@@ -1782,6 +1762,14 @@ class RF_OT_Submit(Operator):
         _sub["frame_count"]      = getattr(scene, "rf_frame_count",       "")
         _sub["task_count"]       = getattr(scene, "rf_task_count",        "")
         _sub["scout_task_count"] = getattr(scene, "rf_scout_task_count",  "")
+        # Snapshot Blender version string for the Response tab job line
+        bv = getattr(scene, "rf_blender_version", "").strip()
+        if not bv:
+            _v = bpy.app.version
+            bv = f"{_v[0]}.{_v[1]}.{_v[2]}"
+        if not bv.lower().startswith("blender"):
+            bv = f"Blender {bv}"
+        _sub["blender_ver_str"] = bv
 
         try:
             return context.window_manager.invoke_props_dialog(
@@ -1896,7 +1884,14 @@ class RF_OT_OpenDashboard(Operator):
 
     def execute(self, context):
         job_number = _sub.get("job_number", "")
-        url = f"{WEB_BASE}/jobs/{job_number}" if job_number else WEB_BASE
+        if job_number:
+            try:
+                padded = str(int(job_number)).zfill(5)
+            except (ValueError, TypeError):
+                padded = str(job_number)
+            url = f"{WEB_BASE}/jobs/{padded}"
+        else:
+            url = WEB_BASE
         try:
             bpy.ops.wm.url_open(url=url)
         except Exception:
