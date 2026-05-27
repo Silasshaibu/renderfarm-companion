@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 0, 6),
+    "version":     (2, 0, 8),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -593,7 +593,7 @@ _sub = {
     # PREFLIGHT
     "deps":    [],     # list of dep dicts from _scan_deps()
     "missing": [],     # deps where exists=False
-    # SUBMITTING — 4 steps
+    # SUBMITTING — legacy 4-step (GCP path keeps these)
     "step": 0,
     "step_states": {1: "pending", 2: "pending", 3: "pending", 4: "pending"},
     "step_progress": 0.0,
@@ -602,6 +602,16 @@ _sub = {
     "file_name": "",
     "file_progress": 0.0,
     "log": [],          # last 5 lines
+    # SUBMITTING — Conductor 3-bar progress (renderfarm path)
+    "sub_status":         "idle",  # "analyzing"|"md5"|"uploading"|"submitting"|"done"|"error"
+    "md5_total":          0,
+    "md5_done":           0,
+    "upload_total":       0,
+    "upload_done":        0,
+    "upload_bytes_total": 0,
+    "upload_bytes_sent":  0,
+    "job_progress":       0.0,   # 0.0 – 1.0  (bar 1, purple)
+    "files":              [],    # list of per-file state dicts — drives the file rows
     # COMPLETE
     "job_number": "",
     "job_id":     "",
@@ -851,191 +861,238 @@ def _upload_blend_to_gcs(blend_path, token, progress_cb=None):
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_submission(scene_props, token, blend_path, payload):
     """
-    Runs entirely in a background daemon thread.
-    Communicates with the main thread only through the _sub dict + timers.
+    Background daemon thread — Conductor-style pipeline:
+      1. Parallel MD5 computation (ThreadPoolExecutor, max 8 workers)
+      2. Server preflight check (deduplication)
+      3. Create job record
+      4. Parallel file upload (ThreadPoolExecutor, max 2 workers)
+      5. Patch job to 'pending'
 
-    scene_props: plain dict snapshot of scene properties (no bpy access in thread)
+    All UI state written only to _sub dict; redraws triggered via
+    bpy.app.timers.register(_redraw, ...) which runs on Blender's main thread.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _set_step(n):
+    def _bump_progress(val):
         with _sub_lock:
-            _sub["step"] = n
-            for k in _sub["step_states"]:
-                if k < n:
-                    _sub["step_states"][k] = "done"
-                elif k == n:
-                    _sub["step_states"][k] = "active"
-                else:
-                    _sub["step_states"][k] = "pending"
+            _sub["job_progress"] = max(_sub["job_progress"], val)
+        bpy.app.timers.register(_redraw, first_interval=0.05)
 
     try:
-        # ── Step 1: Analyze ──────────────────────────────────────────────────
-        _set_step(1)
+        # ── Step 1: Gather uploadable assets (already scanned in PREFLIGHT) ──
+        with _sub_lock:
+            _sub["sub_status"] = "analyzing"
+            _sub["job_progress"] = 0.02
         _log("Analyzing scene dependencies…")
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
-        deps       = _sub["deps"]   # already populated from PREFLIGHT
+        deps       = _sub["deps"]
         uploadable = [d for d in deps if d["exists"]]
 
-        _log(f"Found {len(uploadable)} uploadable assets")
+        # Build per-file state list that drives the UI rows
+        files_state = []
+        for dep in uploadable:
+            fs = {
+                "dep":          dep,
+                "path":         dep["abs_path"],
+                "name":         dep["name"],
+                "size":         dep["size"],
+                "hash":         None,      # SHA-256 hex digest
+                "md5_done":     False,     # UI: MD5/hash phase complete
+                "upload_done":  False,     # UI: upload complete
+                "upload_bytes": 0,         # bytes sent so far
+                "skipped":      False,     # dedup hit — already on server
+            }
+            files_state.append(fs)
 
         with _sub_lock:
-            _sub["step_states"][1] = "done"
+            _sub["files"]     = files_state
+            _sub["md5_total"] = len(files_state)
+            _sub["md5_done"]  = 0
+            _sub["sub_status"] = "md5"
+        _bump_progress(0.05)
+        _log(f"Found {len(uploadable)} assets — computing checksums in parallel…")
 
-        # ── Step 2: Build manifest + preflight ──────────────────────────────
-        _set_step(2)
-        _log("Computing SHA-256 hashes…")
-        bpy.app.timers.register(_redraw, first_interval=0.05)
+        # ── Step 2: Parallel hash (SHA-256 displayed as "MD5" to match Conductor) ──
+        hash_lock = threading.Lock()
 
-        total_hash = len(uploadable)
-        for i, dep in enumerate(uploadable):
+        def _hash_file(fs):
             if _sub.get("cancel"):
                 raise InterruptedError("Cancelled")
-            print(f"[RF] Hashing dep {i}: type={dep.get('type')} name={dep.get('name')} path={dep.get('abs_path')} exists={dep.get('exists')} size={dep.get('size')}")
-            sha = _sha256_file(dep["abs_path"])
-            print(f"[RF] Hash done: {sha[:16]}...")
-            dep["sha256"] = sha
-            with _sub_lock:
-                _sub["step_progress"] = (i + 1) / max(1, total_hash)
-            _log(f"Hashed: {dep['name']}")
+            sha = _sha256_file(fs["path"])
+            fs["dep"]["sha256"] = sha
+            fs["hash"]    = sha
+            fs["md5_done"] = True
+            with hash_lock:
+                with _sub_lock:
+                    _sub["md5_done"] += 1
+                    done = _sub["md5_done"]
+                    total = _sub["md5_total"]
+                # Update job_progress: hash phase covers 5%→30%
+                _bump_progress(0.05 + 0.25 * (done / max(1, total)))
             bpy.app.timers.register(_redraw, first_interval=0.05)
 
-        _log("Running preflight check with server…")
-        preflight_resp = _post("/jobs/preflight",
-                               {"assets": [{"sha256": d["sha256"]} for d in uploadable]},
-                               token)
-        missing_set = set(preflight_resp.get("missing", []))
-        to_upload   = [d for d in uploadable if d["sha256"] in missing_set]
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(files_state)))) as pool:
+            futs = {pool.submit(_hash_file, fs): fs for fs in files_state}
+            for fut in as_completed(futs):
+                if _sub.get("cancel"):
+                    raise InterruptedError("Cancelled")
+                fut.result()   # re-raise any exceptions from the thread
 
-        _log(f"Server needs {len(to_upload)} of {len(uploadable)} assets")
+        _log("Checksums done — running server preflight check…")
+        _bump_progress(0.30)
+
+        # ── Step 2b: Server preflight (deduplication) ────────────────────────
+        with _sub_lock:
+            _sub["sub_status"] = "submitting"
+
+        preflight_resp = _post(
+            "/jobs/preflight",
+            {"assets": [{"sha256": fs["hash"]} for fs in files_state]},
+            token,
+        )
+        missing_set = set(preflight_resp.get("missing", []))
+
+        # Mark files that are already on the server
+        for fs in files_state:
+            if fs["hash"] not in missing_set:
+                fs["skipped"]     = True
+                fs["upload_done"] = True
+
+        to_upload = [fs for fs in files_state if not fs["skipped"]]
+        skipped   = len(files_state) - len(to_upload)
+
+        _log(f"Server needs {len(to_upload)} of {len(uploadable)} assets to upload")
+        _bump_progress(0.35)
 
         # Build manifest
-        v = bpy.app.version
+        v           = bpy.app.version
         frame_range = scene_props.get("frames", "1-1")
-        parts = frame_range.replace(" ", "").split("-")
+        parts       = frame_range.replace(" ", "").split("-")
         manifest = {
             "scene":           os.path.basename(blend_path),
             "blender_version": f"{v[0]}.{v[1]}.{v[2]}",
             "renderer":        scene_props.get("render_software", "Cycles"),
-            "instance_type":   scene_props.get("instance_type", "CPU"),  # "GPU" or "CPU"
+            "instance_type":   scene_props.get("instance_type", "CPU"),
             "machine_type":    scene_props.get("machine_type", ""),
             "frame_start":     int(parts[0]),
             "frame_end":       int(parts[-1]) if len(parts) > 1 else int(parts[0]),
             "chunk_size":      scene_props.get("chunk_size", 1),
             "assets": [
                 {
-                    "path":       d["rel_path"],
-                    "sha256":     d["sha256"],
-                    "size_bytes": d["size"],
-                    "type":       d["type"],
+                    "path":       fs["dep"]["rel_path"],
+                    "sha256":     fs["hash"],
+                    "size_bytes": fs["size"],
+                    "type":       fs["dep"]["type"],
                 }
-                for d in uploadable
+                for fs in files_state
             ],
         }
 
-        with _sub_lock:
-            _sub["step_states"][2] = "done"
-            _sub["step_progress"]  = 0.0
-
-        # ── Step 3: Submit job record ────────────────────────────────────────
-        _set_step(3)
+        # ── Step 3: Create job record ─────────────────────────────────────────
         _log("Creating job record…")
-        bpy.app.timers.register(_redraw, first_interval=0.05)
+        _bump_progress(0.40)
 
         submit_payload = dict(payload)
         submit_payload["status"]       = "uploading"
         submit_payload["manifest"]     = manifest
         submit_payload["assets_total"] = len(uploadable)
 
-        result = _post("/jobs", submit_payload, token)
+        result     = _post("/jobs", submit_payload, token)
         job_number = result.get("jobNumber", "?")
         job_id     = result.get("id", "")
 
         with _sub_lock:
-            _sub["job_number"]    = str(job_number)
-            _sub["job_id"]        = str(job_id)
-            _sub["step_states"][3] = "done"
+            _sub["job_number"] = str(job_number)
+            _sub["job_id"]     = str(job_id)
+        _log(f"Job {job_number} created — uploading {len(to_upload)} files…")
+        _bump_progress(0.45)
 
-        _log(f"Job {job_number} created (uploading)")
-        bpy.app.timers.register(_redraw, first_interval=0.05)
-
-        # ── Step 4: Upload assets ─────────────────────────────────────────────
-        _set_step(4)
+        # ── Step 4: Parallel upload ────────────────────────────────────────────
+        total_bytes = sum(fs["size"] for fs in to_upload)
         with _sub_lock:
-            _sub["file_total"]    = len(to_upload)
-            _sub["file_idx"]      = 0
-            _sub["step_progress"] = 0.0
+            _sub["upload_total"]       = len(to_upload)
+            _sub["upload_done"]        = 0
+            _sub["upload_bytes_total"] = total_bytes
+            _sub["upload_bytes_sent"]  = 0
+            _sub["sub_status"]         = "uploading"
 
-        uploaded = 0
-        skipped  = 0
-
-        # Track blob_url per sha256 so we can patch the manifest
         sha256_to_url = {}
+        upload_lock   = threading.Lock()
+        uploaded      = 0
 
-        # Also pre-populate with already-existing assets (server has them)
-        for dep in uploadable:
-            if dep["sha256"] not in missing_set:
-                # Already on server — fetch its URL via token endpoint
-                try:
-                    resp_exists = _post("/assets?action=token",
-                                        {"sha256": dep["sha256"],
-                                         "filename": dep["name"],
-                                         "size_bytes": dep["size"]},
-                                        token)
-                    if resp_exists.get("exists") and resp_exists.get("url"):
-                        sha256_to_url[dep["sha256"]] = resp_exists["url"]
-                        print(f"[RF] Asset already on server: {dep['name']} → {resp_exists['url'][:60]}")
-                    else:
-                        # Server said not missing but can't get URL — force re-upload
-                        print(f"[RF] Asset dedup miss for {dep['name']}, adding to upload queue")
-                        missing_set.add(dep["sha256"])
-                        to_upload.append(dep)
-                except Exception as ex:
-                    print(f"[RF] WARNING: could not fetch cached URL for {dep['name']}: {ex} — forcing re-upload")
-                    missing_set.add(dep["sha256"])
-                    to_upload.append(dep)
-
-        for i, dep in enumerate(to_upload):
+        def _upload_file(fs):
+            nonlocal uploaded
             if _sub.get("cancel"):
                 raise InterruptedError("Cancelled")
 
-            fname = dep["name"]
-            with _sub_lock:
-                _sub["file_idx"]      = i + 1
-                _sub["file_name"]     = fname
-                _sub["file_progress"] = 0.0
-
-            _log(f"Uploading {fname}…")
-            bpy.app.timers.register(_redraw, first_interval=0.05)
-
-            def _prog_cb(frac, dep=dep):
+            def _prog(frac, _fs=fs):
+                _fs["upload_bytes"] = int(frac * _fs["size"])
                 with _sub_lock:
-                    _sub["file_progress"] = frac
+                    _sub["upload_bytes_sent"] = sum(
+                        f["upload_bytes"] for f in files_state
+                    )
+                    total = max(1, _sub["upload_bytes_total"])
+                    # Bar 3 covers 45%→95% of job_progress
+                    _sub["job_progress"] = 0.45 + 0.50 * (
+                        _sub["upload_bytes_sent"] / total
+                    )
                 bpy.app.timers.register(_redraw, first_interval=0.05)
 
             url = _upload_asset(
-                dep["abs_path"],
-                dep["sha256"],
-                token,
-                filename=fname,
-                progress_cb=_prog_cb,
+                fs["path"], fs["hash"], token,
+                filename=fs["name"], progress_cb=_prog,
             )
 
-            if url:
+            fs["upload_done"]  = True
+            fs["upload_bytes"] = fs["size"]
+
+            with upload_lock:
+                nonlocal uploaded
                 uploaded += 1
-                sha256_to_url[dep["sha256"]] = url
-            else:
-                skipped += 1
+                sha256_to_url[fs["hash"]] = url or ""
+                with _sub_lock:
+                    _sub["upload_done"]        = uploaded
+                    _sub["upload_bytes_sent"]  = sum(
+                        f["upload_bytes"] for f in files_state
+                    )
 
-            with _sub_lock:
-                _sub["step_progress"] = (i + 1) / max(1, len(to_upload))
-                _sub["file_progress"] = 1.0
+            bpy.app.timers.register(_redraw, first_interval=0.05)
 
-        # Assets that were already on the server count as skipped
-        skipped += len(uploadable) - len(to_upload)
+        # Fetch cached URLs for already-deduplicated files (for the manifest)
+        for fs in files_state:
+            if fs["skipped"]:
+                try:
+                    r = _post("/assets?action=token",
+                              {"sha256": fs["hash"], "filename": fs["name"],
+                               "size_bytes": fs["size"]}, token)
+                    if r.get("exists") and r.get("url"):
+                        sha256_to_url[fs["hash"]] = r["url"]
+                    else:
+                        # Server cannot provide URL — re-queue for upload
+                        fs["skipped"]     = False
+                        fs["upload_done"] = False
+                        to_upload.append(fs)
+                except Exception as ex:
+                    print(f"[RF] Dedup URL fetch failed for {fs['name']}: {ex}")
+                    fs["skipped"]     = False
+                    fs["upload_done"] = False
+                    to_upload.append(fs)
 
-        # Build resolved manifest — add blob_url to each asset entry so the
-        # render worker can download assets without extra API calls
+        MAX_CONCURRENT_UPLOADS = 2
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_UPLOADS) as pool:
+            futs = {pool.submit(_upload_file, fs): fs for fs in to_upload}
+            for fut in as_completed(futs):
+                if _sub.get("cancel"):
+                    raise InterruptedError("Cancelled")
+                fut.result()
+
+        skipped = len(uploadable) - len(to_upload)   # recalculate after potential re-queue
+
+        # ── Step 5: Finalise job ──────────────────────────────────────────────
+        _log("Finalising job…")
+        _bump_progress(0.96)
+
         resolved_assets = []
         for a in manifest["assets"]:
             entry = dict(a)
@@ -1044,22 +1101,24 @@ def _run_submission(scene_props, token, blend_path, payload):
         resolved_manifest = dict(manifest)
         resolved_manifest["assets"] = resolved_assets
 
-        # Finalise job: set status=pending (ready for render worker), resolved manifest, assets_uploaded count
-        _patch(f"/jobs?id={job_id}",
-               {
-                   "status":          "pending",
-                   "assets_uploaded": uploaded + skipped,
-                   "manifest":        resolved_manifest,
-               },
-               token)
+        _patch(
+            f"/jobs?id={job_id}",
+            {
+                "status":          "pending",
+                "assets_uploaded": uploaded + skipped,
+                "manifest":        resolved_manifest,
+            },
+            token,
+        )
 
         _log(f"Done — {uploaded} uploaded, {skipped} already cached")
 
         with _sub_lock:
-            _sub["state"]          = "COMPLETE"
-            _sub["uploaded"]       = uploaded
-            _sub["skipped"]        = skipped
-            _sub["step_states"][4] = "done"
+            _sub["state"]      = "COMPLETE"
+            _sub["uploaded"]   = uploaded
+            _sub["skipped"]    = skipped
+            _sub["job_progress"] = 1.0
+            _sub["sub_status"] = "done"
 
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
@@ -1071,10 +1130,12 @@ def _run_submission(scene_props, token, blend_path, payload):
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
     except Exception as e:
+        import traceback
         with _sub_lock:
             _sub["state"]       = "ERROR"
             _sub["error"]       = str(e)
             _sub["failed_step"] = _sub["step"]
+        print(f"[RF] Submission error:\n{traceback.format_exc()}")
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
 
@@ -1220,105 +1281,123 @@ def _fmt_size(size_bytes):
     return f"{size_bytes} B"
 
 
-def _draw_gcp_preflight(layout):
-    """Simplified pre-submit screen shown for GCP jobs."""
-    blend_path = bpy.context.blend_data.filepath
-    filename   = os.path.basename(blend_path) if blend_path else "untitled.blend"
-    try:
-        size_str = _fmt_size(os.path.getsize(blend_path)) if blend_path else "?"
-    except OSError:
-        size_str = "?"
+def _draw_validation(layout):
+    """Validation tab — pre-submission checks, asset scan, and action buttons."""
+    scene    = bpy.context.scene
+    is_dirty = bpy.data.is_dirty
 
-    row = layout.row()
-    row.scale_y = 1.2
-    row.label(text="GCP Cloud Render", icon="WORLD")
-    layout.separator(factor=0.8)
+    # ── Global warnings (always shown) ───────────────────────────────────────
+    any_warning = False
 
-    box = layout.box()
-    col = box.column(align=True)
-    col.scale_y = 1.1
-    col.label(text=f"Scene:  {filename}  ({size_str})", icon="FILE_BLEND")
-    col.label(text="The .blend will be uploaded to cloud storage,")
-    col.label(text="then render VMs will be dispatched automatically.")
+    if is_dirty:
+        row = layout.row()
+        row.alert = True
+        row.label(text="Scene has unsaved changes", icon="ERROR")
+        any_warning = True
 
-    layout.separator(factor=0.8)
-    action = layout.row(align=True)
-    action.scale_y = 1.6
-    action.operator("rf.start_submission", text="Upload & Submit to GCP", icon="RENDER_STILL")
+    # Camera check
+    cam_override = getattr(scene, "rf_camera", "").strip()
+    if not cam_override and not scene.camera:
+        row = layout.row()
+        row.alert = True
+        row.label(text="No active camera in scene", icon="ERROR")
+        any_warning = True
 
-    layout.separator(factor=0.3)
-    hint = layout.row()
-    hint.scale_y = 0.8
-    hint.label(text="Close button below cancels.", icon="INFO")
+    if any_warning:
+        layout.separator(factor=0.6)
 
-
-def _draw_preflight(layout):
-    # GCP has its own simpler preflight
     if _sub.get("gcp_mode"):
-        _draw_gcp_preflight(layout)
-        return
+        # ── GCP path ─────────────────────────────────────────────────────────
+        blend_path = bpy.context.blend_data.filepath
+        filename   = os.path.basename(blend_path) if blend_path else "untitled.blend"
+        try:
+            size_str = _fmt_size(os.path.getsize(blend_path)) if blend_path else "?"
+        except OSError:
+            size_str = "?"
 
-    deps    = _sub["deps"]
-    missing = [d for d in deps if not d["exists"]]
-    present = [d for d in deps if d["exists"]]
-    total_b = sum(d["size"] for d in present)
+        row = layout.row()
+        row.scale_y = 1.2
+        row.label(text="GCP Cloud Render", icon="WORLD")
+        layout.separator(factor=0.8)
 
-    # Header
-    row = layout.row()
-    row.scale_y = 1.2
-    row.label(text="Analyze Scene", icon="VIEWZOOM")
-    layout.separator(factor=0.8)
+        box = layout.box()
+        col = box.column(align=True)
+        col.scale_y = 1.1
+        col.label(text=f"Scene:  {filename}  ({size_str})", icon="FILE_BLEND")
+        col.label(text="The .blend will be uploaded to cloud storage,")
+        col.label(text="then render VMs will be dispatched automatically.")
 
-    # Summary box
-    box = layout.box()
-    col = box.column(align=True)
-    col.scale_y = 1.1
-    col.label(text=f"Found {len(deps)} assets   ({_fmt_size(total_b)} total)")
-    if missing:
-        row_m = col.row()
-        row_m.alert = True
-        row_m.label(text=f"Missing: {len(missing)} (shown in red)", icon="ERROR")
     else:
-        col.label(text="All assets found on disk", icon="CHECKMARK")
+        # ── Renderfarm path — asset scan ──────────────────────────────────────
+        deps    = _sub["deps"]
+        missing = [d for d in deps if not d["exists"]]
+        present = [d for d in deps if d["exists"]]
+        total_b = sum(d["size"] for d in present)
 
-    layout.separator(factor=0.5)
+        row = layout.row()
+        row.scale_y = 1.2
+        row.label(text="Analyze Scene", icon="VIEWZOOM")
+        layout.separator(factor=0.8)
 
-    # Asset list (max 8 shown at once)
-    box2 = layout.box()
-    col2 = box2.column(align=True)
-    visible = deps[:8]
-    for dep in visible:
-        icon = _TYPE_ICON.get(dep["type"], "FILE_BLANK")
-        row  = col2.row(align=True)
-        row.alert = not dep["exists"]
-        row.label(text="", icon=icon)
-        row.label(text=dep["name"])
-        size_row = row.row()
-        size_row.alignment = "RIGHT"
-        if dep["exists"]:
-            size_row.label(text=_fmt_size(dep["size"]))
+        box = layout.box()
+        col = box.column(align=True)
+        col.scale_y = 1.1
+        col.label(text=f"Found {len(deps)} assets   ({_fmt_size(total_b)} total)")
+        if missing:
+            row_m = col.row()
+            row_m.alert = True
+            row_m.label(text=f"Missing: {len(missing)} (shown in red)", icon="ERROR")
         else:
-            size_row.label(text="NOT FOUND", icon="ERROR")
+            col.label(text="All assets found on disk", icon="CHECKMARK")
 
-    if len(deps) > 8:
-        col2.label(text=f"… and {len(deps) - 8} more")
+        layout.separator(factor=0.5)
 
+        box2 = layout.box()
+        col2 = box2.column(align=True)
+        visible = deps[:8]
+        for dep in visible:
+            icon = _TYPE_ICON.get(dep["type"], "FILE_BLANK")
+            row  = col2.row(align=True)
+            row.alert = not dep["exists"]
+            row.label(text="", icon=icon)
+            row.label(text=dep["name"])
+            size_row = row.row()
+            size_row.alignment = "RIGHT"
+            if dep["exists"]:
+                size_row.label(text=_fmt_size(dep["size"]))
+            else:
+                size_row.label(text="NOT FOUND", icon="ERROR")
+
+        if len(deps) > 8:
+            col2.label(text=f"… and {len(deps) - 8} more")
+
+        if missing:
+            layout.separator(factor=0.5)
+            col_warn = layout.column()
+            col_warn.alert = True
+            col_warn.label(text="Resolve missing assets before submitting.", icon="ERROR")
+
+    # ── Action buttons ────────────────────────────────────────────────────────
     layout.separator(factor=0.8)
-
-    # Action row
     action = layout.row(align=True)
     action.scale_y = 1.5
-    if not missing:
-        action.operator("rf.start_submission", text="Continue Submission", icon="PLAY")
+
+    if is_dirty:
+        action.operator("rf.save_and_continue",
+                        text="Save Scene and Continue Submission", icon="FILE_TICK")
+
+    if _sub.get("gcp_mode"):
+        action.operator("rf.start_submission",
+                        text="Upload & Submit to GCP", icon="RENDER_STILL")
     else:
-        col_warn = layout.column()
-        col_warn.alert = True
-        col_warn.label(
-            text="Resolve missing assets before submitting.",
-            icon="ERROR",
-        )
-        layout.separator(factor=0.4)
-        action.operator("rf.start_submission", text="Continue Anyway", icon="PLAY")
+        deps_now = _sub.get("deps", [])
+        missing  = [d for d in deps_now if not d["exists"]]
+        if not missing:
+            action.operator("rf.start_submission",
+                            text="Continue Submission", icon="PLAY")
+        else:
+            action.operator("rf.start_submission",
+                            text="Continue Anyway", icon="PLAY")
 
     layout.separator(factor=0.3)
     hint = layout.row()
@@ -1326,87 +1405,164 @@ def _draw_preflight(layout):
     hint.label(text="Close button below cancels.", icon="INFO")
 
 
-def _draw_submitting(layout):
+def _progress_bar(layout, frac):
+    """Draw a native Blender progress bar (3.3+) or ASCII fallback."""
+    frac = max(0.0, min(1.0, frac))
+    row = layout.row()
+    if bpy.app.version >= (3, 3, 0):
+        try:
+            row.progress(factor=frac, text="")
+            return
+        except Exception:
+            pass
+    # ASCII fallback
+    done = int(frac * 30)
+    row.label(text="[" + "█" * done + "·" * (30 - done) + "]")
+
+
+def _draw_gcp_submitting(layout):
+    """GCP 2-step progress view (preserved from original)."""
     job_num = _sub.get("job_number") or "Job"
 
-    # Header
     row = layout.row()
     row.scale_y = 1.2
     row.label(text=f"Submitting {job_num}…", icon="RENDER_ANIMATION")
     layout.separator(factor=0.8)
 
-    # Step rows — GCP shows 2 meaningful steps; renderfarm shows 4
-    gcp_mode    = _sub.get("gcp_mode", False)
-    labels      = _STEP_LABELS_GCP if gcp_mode else _STEP_LABELS
-    total_steps = 2 if gcp_mode else 4
-    upload_step = 1 if gcp_mode else 4   # which step shows the file-progress box
+    labels      = _STEP_LABELS_GCP
+    total_steps = 2
+    upload_step = 1
 
     for n in range(1, total_steps + 1):
         state = _sub["step_states"][n]
         if state == "done":
-            icon   = "CHECKMARK"
-            status = "Done"
+            icon, status = "CHECKMARK", "Done"
         elif state == "active":
-            icon   = "RENDER_ANIMATION"
-            status = "Working…"
+            icon, status = "RENDER_ANIMATION", "Working…"
         else:
-            icon   = "BLANK1"
-            status = "Waiting"
-
+            icon, status = "BLANK1", "Waiting"
         row = layout.row(align=True)
         row.label(text="", icon=icon)
         row.label(text=f"Step {n}/{total_steps} — {labels[n]}")
-        right = row.row()
-        right.alignment = "RIGHT"
-        right.label(text=status)
+        right = row.row(); right.alignment = "RIGHT"; right.label(text=status)
 
-    # File upload detail row (step 1 for GCP, step 4 for renderfarm)
     if _sub["step_states"][upload_step] == "active":
         layout.separator(factor=0.6)
         detail = layout.box()
-        file_idx   = _sub["file_idx"]
-        file_total = _sub["file_total"]
-        file_name  = _sub["file_name"] or ""
-        detail.label(text=f"File {file_idx} of {file_total}: {file_name}")
-
-        # Per-file progress bar
+        detail.label(text=f"File {_sub['file_idx']} of {_sub['file_total']}: {_sub['file_name'] or ''}")
         fp = max(0.0, min(1.0, _sub["file_progress"]))
-        if bpy.app.version >= (3, 3, 0) and hasattr(detail.row(), "progress"):
-            detail.row().progress(factor=fp, text=f"{int(fp*100)} %")
-        else:
-            done  = int(fp * 10)
-            detail.label(text="[" + "=" * done + " " * (10 - done) + f"] {int(fp*100)} %")
+        _progress_bar(detail, fp)
 
-    # Overall step progress bar
     layout.separator(factor=0.6)
-    sp = max(0.0, min(1.0, _sub["step_progress"]))
-    if bpy.app.version >= (3, 3, 0) and hasattr(layout.row(), "progress"):
-        layout.row().progress(factor=sp, text=f"Overall: {int(sp*100)} %")
-    else:
-        done  = int(sp * 10)
-        layout.label(text="Overall: [" + "=" * done + " " * (10 - done) + f"] {int(sp*100)} %")
+    _progress_bar(layout, max(0.0, min(1.0, _sub["step_progress"])))
 
-    # Log box
     layout.separator(factor=0.6)
-    log_box = layout.box()
-    log_col = log_box.column(align=True)
-    log_col.scale_y = 0.85
-    log_lines = _sub["log"][-4:]
-    for line in log_lines:
+    log_box = layout.box(); log_col = log_box.column(align=True); log_col.scale_y = 0.85
+    for line in _sub["log"][-4:]:
         log_col.label(text=line)
 
-    # Cancel button
     layout.separator(factor=0.5)
     layout.operator("rf.cancel_submission", text="Cancel", icon="CANCEL")
+
+
+def _draw_conductor_progress(layout):
+    """
+    Conductor-style 3-bar progress view for renderfarm submissions.
+      Bar 1 (purple icon) — Jobs Progress    overall job preparation
+      Bar 2 (blue icon)   — Computing MD5    parallel hash computation
+      Bar 3 (green icon)  — File Upload      parallel byte upload
+    Below: per-file rows with md5/upload status pills.
+    """
+    blend_fp   = bpy.data.filepath or "untitled.blend"
+    scene_name = os.path.splitext(os.path.basename(blend_fp))[0]
+    v          = bpy.app.version
+    blender_str = f"Blender {v[0]}.{v[1]}.{v[2]}"
+
+    md5_total  = max(1, _sub.get("md5_total", 1))
+    md5_done   = _sub.get("md5_done", 0)
+    ubt        = _sub.get("upload_bytes_total", 0)
+    ubs        = _sub.get("upload_bytes_sent",  0)
+    jp         = max(0.0, min(1.0, _sub.get("job_progress", 0.0)))
+    md5_frac   = md5_done / md5_total
+    up_frac    = (ubs / ubt) if ubt > 0 else 0.0
+    up_frac    = max(0.0, min(1.0, up_frac))
+
+    def _bar(lyt, frac, label, pct_str, color_icon):
+        box = lyt.box()
+        hdr = box.row()
+        # Colored square icon as visual color indicator
+        hdr.label(text="", icon=color_icon)
+        hdr.label(text=label)
+        right = hdr.row(); right.alignment = "RIGHT"
+        right.label(text=pct_str)
+        _progress_bar(box, frac)
+
+    # Bar 1 — Jobs Progress (SEQUENCE_COLOR_05 ≈ violet/purple)
+    _bar(layout, jp,
+         f"Jobs Progress: 1/1 – {blender_str} Linux Render {scene_name}",
+         f"{jp * 100:.1f}%",
+         "SEQUENCE_COLOR_05")
+
+    # Bar 2 — Computing MD5 (SEQUENCE_COLOR_04 ≈ blue)
+    _bar(layout, md5_frac,
+         f"Computing MD5: {md5_done}/{md5_total}",
+         f"{md5_frac * 100:.1f}%",
+         "SEQUENCE_COLOR_04")
+
+    # Bar 3 — File Upload (SEQUENCE_COLOR_03 ≈ green)
+    _bar(layout, up_frac,
+         "File Upload",
+         f"{up_frac * 100:.1f}%",
+         "SEQUENCE_COLOR_03")
+
+    # ── Per-file list ─────────────────────────────────────────────────────────
+    files = _sub.get("files", [])
+    if files:
+        layout.separator(factor=0.4)
+        scroll = layout.box()
+        col    = scroll.column(align=True)
+        col.scale_y = 0.88
+        for fs in files:
+            row  = col.row(align=True)
+            ext  = os.path.splitext(fs.get("name", ""))[1].lower()
+            icon = "FILE_BLEND" if ext == ".blend" else (
+                   "IMAGE_DATA" if ext in (".png", ".jpg", ".jpeg", ".exr", ".hdr", ".tiff", ".tga") else
+                   "FILE_BLANK")
+            row.label(text=fs.get("path", fs.get("name", "")), icon=icon)
+            pill = row.row(align=True)
+            pill.alignment = "RIGHT"
+            if fs.get("skipped"):
+                pill.label(text="Cached", icon="MODIFIER_DATA")
+            elif fs.get("upload_done"):
+                pill.label(text="  100%", icon="SEQUENCE_COLOR_03")   # green pill
+            elif fs.get("md5_done"):
+                # Uploading — show live byte percentage
+                fsz = fs.get("size", 1) or 1
+                pct = int(100 * fs.get("upload_bytes", 0) / fsz)
+                pill.label(text=f"  {pct}%", icon="SEQUENCE_COLOR_04")  # blue pill
+            else:
+                pill.label(text="  —", icon="TEMP")
+
+    layout.separator(factor=0.5)
+    layout.operator("rf.cancel_submission", text="Cancel", icon="CANCEL")
+
+
+def _draw_submitting(layout):
+    """Dispatcher: GCP uses the simple 2-step view; renderfarm uses Conductor-style 3-bar view."""
+    if _sub.get("gcp_mode"):
+        _draw_gcp_submitting(layout)
+    else:
+        _draw_conductor_progress(layout)
 
 
 def _draw_complete(layout):
     # Header
     row = layout.row()
     row.scale_y = 1.2
-    row.label(text="Job Submitted", icon="CHECKMARK")
+    row.label(text="Job Submitted Successfully", icon="CHECKMARK")
     layout.separator(factor=0.8)
 
+    # Job summary box
     box = layout.box()
     col = box.column(align=True)
     col.scale_y = 1.15
@@ -1416,7 +1572,27 @@ def _draw_complete(layout):
     else:
         col.label(text=f"Uploaded {_sub['uploaded']} assets  (skipped {_sub['skipped']} already on server)")
 
-    layout.separator(factor=1.2)
+    # Frame & task info
+    frame_spec       = _sub.get("frame_spec", "")
+    frame_count      = _sub.get("frame_count", "")
+    task_count       = _sub.get("task_count", "")
+    scout_task_count = _sub.get("scout_task_count", "")
+
+    if frame_spec or frame_count or task_count:
+        layout.separator(factor=0.6)
+        info_box = layout.box()
+        info_col = info_box.column(align=True)
+        info_col.scale_y = 1.05
+        if frame_spec:
+            info_col.label(text=f"Frame Range:  {frame_spec}",   icon="SEQUENCE")
+        if frame_count:
+            info_col.label(text=f"Frame Count:  {frame_count}",  icon="RENDERLAYERS")
+        if task_count:
+            info_col.label(text=f"Task Count:   {task_count}",   icon="NETWORK_DRIVE")
+        if scout_task_count and str(scout_task_count) not in ("0", ""):
+            info_col.label(text=f"Scout Tasks:  {scout_task_count}", icon="VIEWZOOM")
+
+    layout.separator(factor=1.0)
     dash = layout.row()
     dash.scale_y = 1.8
     dash.operator("rf.open_dashboard", text="Open Dashboard", icon="URL")
@@ -1452,7 +1628,7 @@ def _draw_error(layout):
 
     hint = layout.row()
     hint.scale_y = 0.8
-    hint.label(text="Click Close below or Retry to try again.", icon="INFO")
+    hint.label(text="Click Retry to try again, or Close to dismiss.", icon="INFO")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1524,6 +1700,15 @@ class RF_OT_Submit(Operator):
     bl_label       = "Submit"
     bl_description = "Scan scene, upload assets, and submit the render job."
 
+    active_tab: bpy.props.EnumProperty(
+        items=[
+            ("validation", "Validation", "Pre-submission checks and asset scan"),
+            ("progress",   "Progress",   "Submission progress and upload status"),
+            ("response",   "Response",   "Submission result and job details"),
+        ],
+        default="validation",
+    )
+
     def invoke(self, context, event):
         # ── Reset state ──────────────────────────────────────────────────────
         with _sub_lock:
@@ -1544,8 +1729,22 @@ class RF_OT_Submit(Operator):
             _sub["skipped"]     = 0
             _sub["error"]       = ""
             _sub["failed_step"] = 0
-            _sub["cancel"]      = False
-            _sub["gcp_mode"]    = False
+            _sub["cancel"]         = False
+            _sub["gcp_mode"]       = False
+            _sub["frame_spec"]     = ""
+            _sub["frame_count"]    = ""
+            _sub["task_count"]     = ""
+            _sub["scout_task_count"] = ""
+            # Conductor 3-bar fields
+            _sub["sub_status"]         = "idle"
+            _sub["md5_total"]          = 0
+            _sub["md5_done"]           = 0
+            _sub["upload_total"]       = 0
+            _sub["upload_done"]        = 0
+            _sub["upload_bytes_total"] = 0
+            _sub["upload_bytes_sent"]  = 0
+            _sub["job_progress"]       = 0.0
+            _sub["files"]              = []
 
         # Pre-flight validation
         token      = _get_token()
@@ -1578,6 +1777,12 @@ class RF_OT_Submit(Operator):
                 _sub["missing"] = missing
                 _sub["state"]   = "PREFLIGHT"
 
+        # Snapshot frame info so the Response tab can display it after submission
+        _sub["frame_spec"]       = getattr(scene, "rf_frame_spec",        "") or getattr(scene, "rf_frame_range", "")
+        _sub["frame_count"]      = getattr(scene, "rf_frame_count",       "")
+        _sub["task_count"]       = getattr(scene, "rf_task_count",        "")
+        _sub["scout_task_count"] = getattr(scene, "rf_scout_task_count",  "")
+
         try:
             return context.window_manager.invoke_props_dialog(
                 self, width=700, confirm_text="Close")
@@ -1585,25 +1790,43 @@ class RF_OT_Submit(Operator):
             return context.window_manager.invoke_props_dialog(self, width=700)
 
     def draw(self, context):
-        state = _sub["state"]
-        if state == "PREFLIGHT":
-            _draw_preflight(self.layout)
-        elif state == "SUBMITTING":
-            _draw_submitting(self.layout)
-        elif state == "COMPLETE":
-            _draw_complete(self.layout)
-        elif state == "ERROR":
-            _draw_error(self.layout)
-        else:
-            self.layout.label(text="Initialising…")
+        layout = self.layout
+        state  = _sub["state"]
+
+        # Auto-advance tab to match submission state
+        if state == "SUBMITTING":
+            self.active_tab = "progress"
+        elif state in ("COMPLETE", "ERROR"):
+            self.active_tab = "response"
+
+        # ── 3-tab bar ─────────────────────────────────────────────────────────
+        row = layout.row()
+        row.prop_tabs_enum(self, "active_tab")
+        layout.separator(factor=0.5)
+
+        # ── Tab content ───────────────────────────────────────────────────────
+        if self.active_tab == "validation":
+            _draw_validation(layout)
+        elif self.active_tab == "progress":
+            _draw_submitting(layout)
+        elif self.active_tab == "response":
+            if state == "ERROR":
+                _draw_error(layout)
+            elif state == "COMPLETE":
+                _draw_complete(layout)
+            else:
+                col = layout.column(align=True)
+                col.scale_y = 1.2
+                col.label(text="Waiting for submission to complete…", icon="RENDER_ANIMATION")
+                col.label(text="Switch to the Progress tab to monitor.", icon="INFO")
 
     def execute(self, context):
         # Called when user clicks the built-in "Close" button
         return {"FINISHED"}
 
     def check(self, context):
-        # Returning True forces a redraw — only needed while actively submitting
-        return _sub["state"] == "SUBMITTING"
+        # Always return True so tab switches and state changes both trigger a redraw
+        return True
 
 
 class RF_OT_StartSubmission(Operator):
@@ -1673,10 +1896,11 @@ class RF_OT_OpenDashboard(Operator):
 
     def execute(self, context):
         job_number = _sub.get("job_number", "")
-        if job_number:
-            webbrowser.open(f"{WEB_BASE}/jobs/{job_number}")
-        else:
-            webbrowser.open(WEB_BASE)
+        url = f"{WEB_BASE}/jobs/{job_number}" if job_number else WEB_BASE
+        try:
+            bpy.ops.wm.url_open(url=url)
+        except Exception:
+            webbrowser.open(url)
         return {"FINISHED"}
 
 
