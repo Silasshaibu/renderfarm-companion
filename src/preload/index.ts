@@ -44,8 +44,8 @@ const api = {
         Promise<{ pyPath: string; jsonPath: string; folder: string } | null>,
   },
   frames: {
-    download: (outputs: string[], jobNumber: string, outputPath?: string) =>
-      ipcRenderer.invoke('frames:download', { outputs, jobNumber, outputPath }) as
+    download: (outputs: string[], jobNumber: string, outputPath?: string, token?: string) =>
+      ipcRenderer.invoke('frames:download', { outputs, jobNumber, outputPath, token }) as
         Promise<{ success: boolean; count?: number; failedNums?: number[]; folder?: string; error?: string }>,
     countExisting: (folder: string, frames: string) =>
       ipcRenderer.invoke('frames:countExisting', { folder, frames }) as Promise<{ existing: number }>,

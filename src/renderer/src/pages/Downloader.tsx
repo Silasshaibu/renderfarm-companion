@@ -89,22 +89,6 @@ function mapJob(j: ApiJob): RenderJob {
 }
 
 
-const STATUS_LABEL: Record<string, string> = {
-  success:        'Completed',
-  downloaded:     'Downloaded',
-  running:        'Running',
-  syncing:        'Syncing',
-  failed:         'Failed',
-  queued:         'Queued',
-  pending:        'Pending',
-  holding:        'Holding',
-  uploading:      'Uploading',
-  upload_pending: 'Upload Pending',
-  sync_pending:   'Sync Pending',
-  sync_failed:    'Sync Failed',
-  killed:         'Killed',
-  preempted:      'Preempted',
-}
 
 const FILTER_OPTIONS = [
   'Last 5 jobs',
@@ -258,10 +242,23 @@ export default function DownloaderPage({
 
   useEffect(() => {
     fetchJobs()
-    // Poll every 10 s so running jobs update live
-    const timer = setInterval(() => fetchJobs(true), 10_000)
+    // Poll every 15 s; also refresh outputs for any running jobs so counts stay current
+    const timer = setInterval(async () => {
+      await fetchJobs(true)
+      setJobs(current => {
+        const running = current.filter(j => j.status === 'running')
+        if (running.length) {
+          Promise.allSettled(
+            running.map(j =>
+              window.rfApi.jobs.refreshOutputs(auth.token, j.num).catch(() => {})
+            )
+          ).then(() => fetchJobs(true))
+        }
+        return current
+      })
+    }, 15_000)
     return () => clearInterval(timer)
-  }, [fetchJobs])
+  }, [fetchJobs, auth.token])
 
   // ── UI helpers ────────────────────────────────────────────────────────────
   const toggle = (id: string) => {
@@ -308,10 +305,51 @@ export default function DownloaderPage({
     return list
   }, [jobs, search, filter])
 
-  const handleRefresh = () => {
+  const TERMINAL = new Set(['success', 'downloaded', 'failed', 'killed', 'done'])
+
+  // Re-count frames on disk for a single job and update dlExisting
+  const recountDisk = useCallback((job: RenderJob, overridePath: string) => {
+    const folder = overridePath !== undefined ? overridePath : (job.outputPath ?? '')
+    if (!folder) return
+    window.rfApi.frames.countExisting(folder, job.frames).then(({ existing }) => {
+      setDlExisting(e => ({ ...e, [job.id]: existing }))
+    }).catch(() => {})
+  }, [])
+
+  const handleRefresh = async () => {
     setLoading(true)
     setStatus('Refreshing…')
-    fetchJobs()
+    await fetchJobs()
+
+    // Clear stale download progress for jobs not currently downloading so
+    // the disk recount (below) takes effect instead of the last download count
+    setDlProgress(p => {
+      const n = { ...p }
+      for (const jobId of Object.keys(n)) {
+        if (!dlActive.has(jobId)) delete n[jobId]
+      }
+      return n
+    })
+
+    // For every non-terminal job, hit refresh-outputs so the signed-URL list is current
+    setJobs(current => {
+      const nonTerminal = current.filter(j => !TERMINAL.has(j.status))
+      if (nonTerminal.length) {
+        Promise.allSettled(
+          nonTerminal.map(j =>
+            window.rfApi.jobs.refreshOutputs(auth.token, j.num).catch(() => {})
+          )
+        ).then(() => fetchJobs(true))
+      }
+
+      // Re-count frames on disk for all jobs that have an output path
+      for (const job of current) {
+        const folder = pathOverrides[job.id] !== undefined ? pathOverrides[job.id] : (job.outputPath ?? '')
+        if (folder) recountDisk(job, folder)
+      }
+
+      return current
+    })
   }
 
   const handleDownload = async (job: RenderJob) => {
@@ -341,7 +379,7 @@ export default function DownloaderPage({
       }
     })
 
-    const result = await window.rfApi.frames.download(job.outputs, job.num, resolvedPath || undefined)
+    const result = await window.rfApi.frames.download(job.outputs, job.num, resolvedPath || undefined, auth.token)
 
     setDlActive(s => { const n = new Set(s); n.delete(job.id); return n })
 

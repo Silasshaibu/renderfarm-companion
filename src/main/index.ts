@@ -305,7 +305,7 @@ app.whenReady().then(() => {
   })
 
   // ── Frame download IPC ───────────────────────────────────────────────────────
-  ipcMain.handle('frames:download', async (_e, { outputs, jobNumber, outputPath }: { outputs: string[]; jobNumber: string; outputPath?: string }) => {
+  ipcMain.handle('frames:download', async (_e, { outputs, jobNumber, outputPath, token }: { outputs: string[]; jobNumber: string; outputPath?: string; token?: string }) => {
     const { dialog } = await import('electron')
     const https      = await import('https')
     const fs         = await import('fs')
@@ -347,7 +347,8 @@ app.whenReady().then(() => {
     }
 
     let count         = 0
-    const failedNums: number[] = []   // actual frame numbers that failed
+    const failedNums:    number[] = []
+    const successNums:   number[] = []   // frame numbers now on disk (skipped + newly downloaded)
 
     for (let i = 0; i < outputs.length; i++) {
       const url      = outputs[i]
@@ -368,6 +369,7 @@ app.whenReady().then(() => {
       // Skip frames that are already on disk (checked by frame number, not exact path)
       if (existingFrameNums.has(frameNum)) {
         count++
+        successNums.push(frameNum)
         getMainWindow()?.webContents.send('frames:progress', {
           jobNumber, count, failedNums, total: outputs.length,
         })
@@ -383,6 +385,7 @@ app.whenReady().then(() => {
           }).on('error', (err) => { fs.unlink(dest, () => {}); reject(err) })
         })
         count++
+        successNums.push(frameNum)
       } catch {
         failedNums.push(frameNum)
       }
@@ -391,6 +394,15 @@ app.whenReady().then(() => {
       getMainWindow()?.webContents.send('frames:progress', {
         jobNumber, count, failedNums, total: outputs.length,
       })
+    }
+
+    // Notify the web API which frames are now on disk so it can mark tasks as 'downloaded'
+    if (token && successNums.length > 0) {
+      apiRequest(`/jobs/${jobNumber}/frames-downloaded`, {
+        method:  'POST',
+        headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+        body:    JSON.stringify({ frames: successNums }),
+      }).catch(() => { /* best effort */ })
     }
 
     return { success: true, count, failedNums, folder }
