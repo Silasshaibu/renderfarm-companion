@@ -330,6 +330,22 @@ app.whenReady().then(() => {
     const folder = baseFolder
     fs.mkdirSync(folder, { recursive: true })
 
+    // Scan the folder once and build a set of already-present frame numbers.
+    // This is more robust than existsSync(dest) because it handles extension
+    // differences (e.g. .PNG vs .png) and zero-padding variations, so we
+    // never overwrite a file that's already on disk.
+    let existingFrameNums: Set<number>
+    try {
+      existingFrameNums = new Set(
+        fs.readdirSync(folder).flatMap(f => {
+          const m = path.basename(f, path.extname(f)).match(/(\d+)$/)
+          return m ? [parseInt(m[1], 10)] : []
+        })
+      )
+    } catch {
+      existingFrameNums = new Set()
+    }
+
     let count         = 0
     const failedNums: number[] = []   // actual frame numbers that failed
 
@@ -349,8 +365,8 @@ app.whenReady().then(() => {
       const filename = String(frameNum).padStart(4, '0') + ext
       const dest     = path.join(folder, filename)
 
-      // Skip frames that already exist on disk
-      if (fs.existsSync(dest)) {
+      // Skip frames that are already on disk (checked by frame number, not exact path)
+      if (existingFrameNums.has(frameNum)) {
         count++
         getMainWindow()?.webContents.send('frames:progress', {
           jobNumber, count, failedNums, total: outputs.length,
