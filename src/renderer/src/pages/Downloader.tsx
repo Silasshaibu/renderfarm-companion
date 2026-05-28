@@ -445,12 +445,12 @@ export default function DownloaderPage({
                                       : (job.outputPath ?? '')
                 const prog        = dlProgress[job.id]
                 const isActive    = dlActive.has(job.id)
-                const canDownload = ['success', 'downloaded'].includes(job.status) && !!job.outputs?.length
-                const totalFrames = job.outputs?.length ?? 0
+                const canDownload = !!job.outputs?.length
+                const availFrames = job.outputs?.length ?? 0   // frames with signed URLs ready
                 const existing    = dlExisting[job.id] ?? 0
                 // While downloading use live progress; before/after use existing count
                 const progCount   = prog ? prog.count : existing
-                const progTotal   = prog ? prog.total : totalFrames
+                const progTotal   = prog ? prog.total : availFrames
                 const progPct     = progTotal > 0 ? (progCount / progTotal) * 100 : 0
                 const failNums    = dlFailed[job.id] ?? []
                 const failCount   = failNums.length
@@ -637,9 +637,11 @@ export default function DownloaderPage({
                         disabled={!canDownload || isActive}
                         title={
                           !canDownload
-                            ? `Job is ${label.toLowerCase()} — cannot download yet`
+                            ? 'No frames ready yet — waiting for first frame to complete'
                             : isActive ? 'Download in progress…'
-                            : 'Download rendered frames'
+                            : availFrames > 0 && !['success','downloaded'].includes(job.status)
+                              ? `Download ${availFrames} completed frame${availFrames > 1 ? 's' : ''} (job still running)`
+                              : 'Download rendered frames'
                         }
                       >
                         {isActive ? 'Downloading…' : 'DOWNLOAD'}
