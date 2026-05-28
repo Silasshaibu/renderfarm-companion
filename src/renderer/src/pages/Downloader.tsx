@@ -271,9 +271,19 @@ export default function DownloaderPage({
         n.delete(id)
       } else {
         n.add(id)
-        // Check how many frames are already on disk when expanding
         const job = jobs.find(j => j.id === id)
-        if (job?.outputs?.length) {
+        if (!job) return n
+
+        // If job has completed tasks but no outputs yet, ask the server to scan GCS now
+        const hasCompletedTasks = !['pending','queued','uploading','upload_pending','sync_pending','syncing'].includes(job.status)
+        if (hasCompletedTasks && !job.outputs?.length) {
+          window.rfApi.jobs.refreshOutputs(auth.token, job.num).then(() => {
+            fetchJobs(true)
+          }).catch(() => { /* best-effort */ })
+        }
+
+        // Check how many frames are already on disk when expanding
+        if (job.outputs?.length) {
           const folder = pathOverrides[id] !== undefined ? pathOverrides[id] : (job.outputPath ?? '')
           if (folder) {
             window.rfApi.frames.countExisting(folder, job.frames).then(({ existing }) => {
@@ -407,7 +417,6 @@ export default function DownloaderPage({
 
         {!loading && visible.map(job => {
           const isOpen = expanded.has(job.id)
-          const label  = STATUS_LABEL[job.status] ?? job.status
 
           return (
             <div key={job.id} className="dl-job">

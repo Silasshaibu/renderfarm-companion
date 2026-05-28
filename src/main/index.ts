@@ -93,6 +93,13 @@ app.whenReady().then(() => {
     })
   })
 
+  ipcMain.handle('jobs:refreshOutputs', async (_e, { token, jobNumber }: { token: string; jobNumber: string }) => {
+    return apiRequest(`/jobs/${jobNumber}/refresh-outputs`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+    })
+  })
+
   ipcMain.handle('jobs:create', async (_e, { token, data }: { token: string; data: object }) => {
     return apiRequest('/jobs', {
       method: 'POST',

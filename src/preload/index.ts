@@ -6,8 +6,9 @@ const api = {
       ipcRenderer.invoke('auth:login', { email, password }),
   },
   jobs: {
-    list:   (token: string)             => ipcRenderer.invoke('jobs:list', token),
-    create: (token: string, data: object) => ipcRenderer.invoke('jobs:create', { token, data }),
+    list:           (token: string)                      => ipcRenderer.invoke('jobs:list', token),
+    create:         (token: string, data: object)        => ipcRenderer.invoke('jobs:create', { token, data }),
+    refreshOutputs: (token: string, jobNumber: string)   => ipcRenderer.invoke('jobs:refreshOutputs', { token, jobNumber }),
   },
   projects: {
     list: (token: string) => ipcRenderer.invoke('projects:list', token),

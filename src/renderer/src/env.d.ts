@@ -6,8 +6,9 @@ interface Window {
       login: (email: string, password: string) => Promise<{ access_token: string; user: { id: string; email: string; isAdmin: boolean } }>
     }
     jobs: {
-      list:   (token: string) => Promise<unknown[]>
-      create: (token: string, data: object) => Promise<{ jobNumber: string }>
+      list:           (token: string) => Promise<unknown[]>
+      create:         (token: string, data: object) => Promise<{ jobNumber: string }>
+      refreshOutputs: (token: string, jobNumber: string) => Promise<{ ok: boolean; count: number }>
     }
     projects: {
       list: (token: string) => Promise<{ id: string; name: string; isActive: boolean }[]>
