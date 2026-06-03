@@ -537,6 +537,30 @@ def _build_payload(context):
         "output_folder":       scene.rf_output_folder,
         "disable_audio":       scene.rf_disable_audio,
         "extra_env":           env,
+        "notifications": {
+            "email":     getattr(scene, "rf_notify_email", True),
+            "sound":     getattr(scene, "rf_notify_sound", True),
+            "notify_on": getattr(scene, "rf_notify_on",    "BOTH"),
+        },
+        # Full render settings snapshot — used by dashboard Re-render modal to pre-fill settings
+        "render_settings": {
+            "samples":             scene.rf_samples,
+            "resolution_x":        scene.rf_resolution_x,
+            "resolution_y":        scene.rf_resolution_y,
+            "resolution_pct":      scene.rf_resolution_pct,
+            "output_path":         scene.rf_output_folder,
+            "engine":              scene.rf_render_software.upper(),
+            "cameras":             [scene.get("rf_camera_override", "Camera")],
+            "active_camera":       scene.get("rf_camera_override", "Camera"),
+            "chunk_size":          scene.rf_chunk_size,
+            "instance_type":       scene.rf_instance_type,
+            "machine_type":        scene.get("rf_machine_type", ""),
+            "preemptible":         scene.rf_preemptible,
+            "preemptible_retries": scene.rf_preemptible_retries,
+            "scout_frames":        scene.rf_scout_frames if scene.rf_use_scout_frames else "",
+            "frame_range":         frame_range,
+            "blender_version":     scene.rf_blender_version,
+        },
         # blender_file intentionally omitted — the blob URL is set via manifest after upload
     }
 
@@ -1122,6 +1146,9 @@ def _run_submission(scene_props, token, blend_path, payload):
 
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
+        # Start job poller for sound/popup notification
+        _maybe_start_poller(scene_props, str(_sub.get("job_number", "")), token)
+
     except InterruptedError:
         with _sub_lock:
             _sub["state"]       = "ERROR"
@@ -1227,6 +1254,9 @@ def _run_gcp_submission(scene_props, token, blend_path, payload):
             _sub["uploaded"] = 1
             _sub["skipped"]  = 0
         bpy.app.timers.register(_redraw, first_interval=0.05)
+
+        # Start job poller for sound/popup notification
+        _maybe_start_poller(scene_props, str(job_number), token)
 
     except InterruptedError:
         with _sub_lock:
@@ -1671,6 +1701,629 @@ class RF_OT_PreviewScript(Operator):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sound player + job poller for completion notifications
+# ──────────────────────────────────────────────────────────────────────────────
+
+import wave as _wave
+import struct as _struct
+import math as _math
+
+
+def _ensure_sounds():
+    """Generate WAV notification sounds programmatically on first run."""
+    sounds_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+    os.makedirs(sounds_dir, exist_ok=True)
+
+    def _write_wav(path, notes):
+        SR = 44100
+        frames = []
+        for freq, t_start, t_dur, amp, decay in notes:
+            n_start = int(t_start * SR)
+            n_end   = int((t_start + t_dur) * SR)
+            for i in range(n_start, n_end):
+                t       = (i - n_start) / SR
+                env     = _math.exp(-t * decay)
+                sample  = int(amp * env * _math.sin(2 * _math.pi * freq * t))
+                frames.append(_struct.pack('<h', max(-32767, min(32767, sample))))
+        # Pad to full duration so notes overlap cleanly
+        total = int(max(t + t_dur for _, t, t_dur, __, ___ in notes) * SR + 0.05 * SR)
+        while len(frames) < total:
+            frames.append(_struct.pack('<h', 0))
+        with _wave.open(path, 'w') as f:
+            f.setnchannels(1); f.setsampwidth(2); f.setframerate(SR)
+            f.writeframes(b''.join(frames))
+
+    success = os.path.join(sounds_dir, "render_complete.wav")
+    if not os.path.exists(success):
+        # C5 → E5 → G5 ascending chime
+        _write_wav(success, [
+            (523, 0.00, 0.50, 28000, 3.5),
+            (659, 0.28, 0.50, 28000, 3.5),
+            (784, 0.56, 0.70, 28000, 2.8),
+        ])
+
+    failed = os.path.join(sounds_dir, "render_failed.wav")
+    if not os.path.exists(failed):
+        # Two descending soft tones
+        _write_wav(failed, [
+            (400, 0.00, 0.35, 20000, 4.5),
+            (300, 0.32, 0.55, 18000, 3.5),
+        ])
+
+
+def _get_sound_file(status):
+    name = "render_complete.wav" if status == "success" else "render_failed.wav"
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds", name)
+    return path if os.path.exists(path) else None
+
+
+def _get_user_email():
+    try:
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        return getattr(prefs, "user_email", "") or ""
+    except Exception:
+        return ""
+
+
+class RF_SoundPlayer:
+    """Cross-platform notification sound playback."""
+
+    @staticmethod
+    def play(status="success"):
+        import platform, subprocess
+        system = platform.system()
+        sf = _get_sound_file(status)
+        if system == "Windows":
+            try:
+                import winsound
+                if sf:
+                    winsound.PlaySound(sf, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                else:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK if status == "success" else winsound.MB_ICONHAND)
+            except Exception:
+                pass
+        elif system == "Darwin":
+            fallback = "/System/Library/Sounds/Glass.aiff" if status == "success" else "/System/Library/Sounds/Basso.aiff"
+            target = sf if sf else fallback
+            subprocess.Popen(["afplay", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            if sf:
+                for player in ["paplay", "aplay", "ffplay"]:
+                    try:
+                        subprocess.Popen([player, sf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        return
+                    except FileNotFoundError:
+                        continue
+            print("\a", end="", flush=True)
+
+
+def _get_poll_interval(frame_count):
+    if frame_count <= 10:   return 15.0
+    if frame_count <= 100:  return 30.0
+    if frame_count <= 500:  return 60.0
+    return 120.0
+
+
+class RF_JobPoller:
+    """Polls server for job status after submission; triggers sound + Blender popup on completion."""
+
+    def __init__(self, job_number, notify_on, token, frame_count=1, job_title=""):
+        self.job_number  = str(job_number)
+        self.notify_on   = notify_on
+        self.token       = token
+        self.interval    = _get_poll_interval(frame_count)
+        self.job_title   = job_title
+        self.poll_count  = 0
+        self.max_polls   = int(6 * 3600 / max(1, self.interval))
+        self.notified    = False
+
+    def start(self):
+        bpy.app.timers.register(self._poll, first_interval=self.interval)
+
+    def _poll(self):
+        if self.notified or self.poll_count >= self.max_polls:
+            return None
+        self.poll_count += 1
+        threading.Thread(target=self._check, daemon=True).start()
+        return self.interval
+
+    def _check(self):
+        try:
+            import urllib.request, json as _json
+            url = f"{WEB_BASE}/api/jobs/{self.job_number}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            status = data.get("status", "")
+            should = (
+                (self.notify_on == "SUCCESS" and status == "success") or
+                (self.notify_on == "FAILURE" and status in ("failed", "error")) or
+                (self.notify_on == "BOTH"    and status in ("success", "failed", "error"))
+            )
+            if should and not self.notified:
+                self.notified = True
+                s = "success" if status == "success" else "failed"
+                bpy.app.timers.register(lambda: self._notify(s), first_interval=0.05)
+        except Exception as e:
+            print(f"[RF Poller] {e}")
+
+    def _notify(self, status):
+        threading.Thread(target=lambda: RF_SoundPlayer.play(status), daemon=True).start()
+        title_str = self.job_title or f"Job {self.job_number}"
+        icon = "CHECKMARK" if status == "success" else "ERROR"
+        msg  = f"✓ Render complete: {title_str}" if status == "success" else f"✗ Render failed: {title_str}"
+        def _popup():
+            try:
+                bpy.context.window_manager.popup_menu(
+                    lambda s, c: s.layout.label(text=msg, icon=icon),
+                    title="Renderfarm Notification", icon="INFO"
+                )
+            except Exception:
+                pass
+            return None
+        bpy.app.timers.register(_popup, first_interval=0.1)
+        return None
+
+
+def _maybe_start_poller(scene_props, job_number, token):
+    """Start job poller if sound notification is enabled for this job."""
+    try:
+        notifs = scene_props.get("notifications", {}) if isinstance(scene_props, dict) else {}
+        if not notifs.get("sound", False):
+            return
+        notify_on  = notifs.get("notify_on", "BOTH")
+        frame_count = 1
+        try:
+            frames_str = scene_props.get("frames", "1-1") if isinstance(scene_props, dict) else "1-1"
+            parts = str(frames_str).replace(" ", "").split("-")
+            frame_count = abs(int(parts[-1]) - int(parts[0])) + 1 if len(parts) == 2 else 1
+        except Exception:
+            pass
+        title = scene_props.get("title", "") if isinstance(scene_props, dict) else ""
+        poller = RF_JobPoller(job_number, notify_on, token, frame_count, title)
+        poller.start()
+    except Exception as e:
+        print(f"[RF] Poller start error: {e}")
+
+
+class RF_OT_PreviewSound(Operator):
+    bl_idname = "rf.preview_sound"
+    bl_label  = "Preview Sound"
+    bl_description = "Play the notification sound as a preview"
+
+    def execute(self, context):
+        threading.Thread(target=lambda: RF_SoundPlayer.play("success"), daemon=True).start()
+        self.report({"INFO"}, "Playing preview sound…")
+        return {"FINISHED"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Standalone tkinter submission window
+# ──────────────────────────────────────────────────────────────────────────────
+
+try:
+    import tkinter as _tk
+    _TK_AVAILABLE = True
+except ImportError:
+    _TK_AVAILABLE = False
+
+
+class SubmissionWindow:
+    """
+    Standalone OS-level window for the render submission dialog.
+    Runs on its own daemon thread so Blender stays fully responsive.
+    Matches the Conductor Submission window layout exactly:
+      Tab bar: Validation | Progress | Response
+      Footer:  Close | Save Scene and Continue Submission | Continue Submission
+    """
+
+    # ── colors ────────────────────────────────────────────────────────────────
+    BG         = "#2b2b2b"
+    CONTENT_BG = "#1e1e1e"
+    TAB_BG     = "#333333"
+    ACTIVE_TAB = "#444444"
+    BTN_BG     = "#3a3a3a"
+    WARN_BG    = "#2a2416"
+    FG         = "#cccccc"
+    FG_DIM     = "#aaaaaa"
+    FG_WARN    = "#dddddd"
+    ORANGE     = "#e8a020"
+    BAR_TRACK  = "#111111"
+    BAR_JOB    = "#7c6fd8"   # purple
+    BAR_MD5    = "#378ADD"   # blue
+    BAR_UP     = "#1D9E75"   # green
+    RED        = "#e05555"
+    GREEN      = "#5DCAA5"
+
+    def __init__(self, validation_info: dict):
+        """
+        validation_info keys:
+          is_dirty   bool    – scene has unsaved changes
+          no_camera  bool    – no active camera
+          dep_count  int     – total assets found
+          missing    list    – list of missing asset dicts (name, path)
+          deps       list    – full dep list (name, size, exists)
+          gcp_mode   bool    – GCP submission path
+        """
+        self.vi      = validation_info
+        self.root    = None
+        self._closed = False
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def open(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def close(self):
+        if self.root and not self._closed:
+            self.root.after(0, self._destroy)
+
+    # ── thread entry point ────────────────────────────────────────────────────
+
+    def _run(self):
+        self.root = _tk.Tk()
+        self._build()
+        self._poll()               # start state-poll loop
+        self.root.mainloop()
+
+    # ── window construction ───────────────────────────────────────────────────
+
+    def _build(self):
+        r = self.root
+        r.title("Renderfarm Submission")
+        r.configure(bg=self.BG)
+        r.minsize(600, 420)
+        r.resizable(True, True)
+        r.attributes("-topmost", True)
+
+        # Centre on screen
+        r.update_idletasks()
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        w, h   = 740, 520
+        r.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        r.protocol("WM_DELETE_WINDOW", self._on_close_btn)
+
+        # ── tab bar ───────────────────────────────────────────────────────────
+        tab_bar = _tk.Frame(r, bg=self.TAB_BG, height=34)
+        tab_bar.pack(fill="x", side="top")
+        tab_bar.pack_propagate(False)
+        self._tab_btns = {}
+        for name in ("Validation", "Progress", "Response"):
+            b = _tk.Button(
+                tab_bar, text=name,
+                bg=self.TAB_BG, fg=self.FG,
+                relief="flat", padx=16, pady=6,
+                font=("Segoe UI", 9), cursor="hand2",
+                activebackground=self.ACTIVE_TAB, activeforeground="#fff",
+                command=lambda n=name.lower(): self._switch(n),
+            )
+            b.pack(side="left")
+            self._tab_btns[name.lower()] = b
+
+        # ── content area ──────────────────────────────────────────────────────
+        self._content = _tk.Frame(r, bg=self.CONTENT_BG)
+        self._content.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+
+        self._build_validation_frame()
+        self._build_progress_frame()
+        self._build_response_frame()
+
+        # ── footer ────────────────────────────────────────────────────────────
+        footer = _tk.Frame(r, bg=self.BG)
+        footer.pack(fill="x", side="bottom", padx=10, pady=8)
+        self._footer = footer
+
+        self._build_validation_footer(footer)
+        self._build_progress_footer(footer)
+        self._build_response_footer(footer)
+
+        # Start on validation tab
+        self._switch("validation")
+
+    # ── validation tab ────────────────────────────────────────────────────────
+
+    def _build_validation_frame(self):
+        f = _tk.Frame(self._content, bg=self.CONTENT_BG)
+        self._val_frame = f
+        vi = self.vi
+
+        warnings = []
+        if vi.get("is_dirty"):
+            warnings.append(
+                ("Save Scene Before Submission",
+                 "The scene contains unsaved modifications. To include recent changes "
+                 "select 'Save Scene and Continue Submission'. If you prefer to proceed "
+                 "without saving, choose 'Continue Submission'.")
+            )
+        if vi.get("no_camera"):
+            warnings.append(("No Active Camera", "No camera is set as the active scene camera."))
+
+        if warnings:
+            for title, body in warnings:
+                box = _tk.Frame(f, bg=self.WARN_BG)
+                box.pack(fill="x", padx=16, pady=(12, 4))
+                inner = _tk.Frame(box, bg=self.WARN_BG)
+                inner.pack(fill="x", padx=12, pady=10)
+                _tk.Label(inner, text="!", fg=self.ORANGE, bg=self.WARN_BG,
+                          font=("Segoe UI", 18, "bold"), width=2).pack(side="left", anchor="n")
+                tf = _tk.Frame(inner, bg=self.WARN_BG)
+                tf.pack(side="left", fill="x", expand=True, padx=(8, 0))
+                _tk.Label(tf, text=f"[{title}]:", fg=self.FG_WARN, bg=self.WARN_BG,
+                          font=("Segoe UI", 9, "bold"), anchor="w", justify="left").pack(fill="x")
+                _tk.Label(tf, text=body, fg=self.FG_DIM, bg=self.WARN_BG,
+                          font=("Segoe UI", 9), anchor="w", justify="left",
+                          wraplength=580).pack(fill="x", pady=(3, 0))
+
+        # Asset summary
+        deps    = vi.get("deps", [])
+        missing = vi.get("missing", [])
+        if not vi.get("gcp_mode") and deps:
+            total_bytes = sum(d.get("size", 0) for d in deps if d.get("exists"))
+            summary_txt = (f"Found {len(deps)} assets  ({_fmt_size(total_bytes)} total)  —  "
+                           f"{len(missing)} missing" if missing else
+                           f"Found {len(deps)} assets  ({_fmt_size(total_bytes)} total)  —  All found")
+            _tk.Label(f, text=summary_txt, fg=self.FG_DIM, bg=self.CONTENT_BG,
+                      font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=16, pady=(8, 2))
+            # List up to 8 deps
+            list_frame = _tk.Frame(f, bg="#252525")
+            list_frame.pack(fill="x", padx=16, pady=(0, 8))
+            for dep in deps[:8]:
+                row = _tk.Frame(list_frame, bg="#252525")
+                row.pack(fill="x", padx=8, pady=1)
+                col = "#e05555" if not dep.get("exists") else self.FG
+                _tk.Label(row, text=dep.get("name", ""), fg=col, bg="#252525",
+                          font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
+                size_txt = "NOT FOUND" if not dep.get("exists") else _fmt_size(dep.get("size", 0))
+                _tk.Label(row, text=size_txt, fg=col, bg="#252525",
+                          font=("Segoe UI", 8), anchor="e").pack(side="right")
+            if len(deps) > 8:
+                _tk.Label(list_frame, text=f"… and {len(deps)-8} more", fg=self.FG_DIM,
+                          bg="#252525", font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=8, pady=2)
+
+    def _build_validation_footer(self, parent):
+        f = _tk.Frame(parent, bg=self.BG)
+        self._val_footer = f
+        vi = self.vi
+
+        def _btn(text, cmd):
+            return _tk.Button(f, text=text, bg=self.BTN_BG, fg=self.FG,
+                              relief="flat", padx=16, pady=7, font=("Segoe UI", 9),
+                              cursor="hand2", activebackground="#4a4a4a",
+                              command=cmd)
+
+        _btn("Close", self._on_close_btn).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        if vi.get("is_dirty"):
+            _btn("Save Scene and Continue Submission",
+                 self._on_save_and_continue).pack(side="left", expand=True, fill="x", padx=3)
+        _btn("Continue Submission",
+             self._on_continue).pack(side="left", expand=True, fill="x", padx=(3, 0))
+
+    # ── progress tab ──────────────────────────────────────────────────────────
+
+    def _build_progress_frame(self):
+        f = _tk.Frame(self._content, bg=self.CONTENT_BG)
+        self._prog_frame = f
+
+        bars = _tk.Frame(f, bg=self.CONTENT_BG)
+        bars.pack(fill="x", padx=16, pady=12)
+
+        def _bar_widget(parent, label_text, color):
+            lf = _tk.Frame(parent, bg=self.CONTENT_BG)
+            lf.pack(fill="x", pady=(0, 2))
+            lbl = _tk.Label(lf, text=label_text, fg=self.FG, bg=self.CONTENT_BG,
+                            font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            pct_lbl = _tk.Label(lf, text="0.0%", fg=self.FG_DIM, bg=self.CONTENT_BG,
+                                 font=("Segoe UI", 9))
+            pct_lbl.pack(side="right")
+            track = _tk.Frame(parent, bg=self.BAR_TRACK, height=8)
+            track.pack(fill="x", pady=(0, 10))
+            track.pack_propagate(False)
+            fill = _tk.Frame(track, bg=color, height=8)
+            fill.place(relx=0, rely=0, relwidth=0.0, relheight=1.0)
+            return lbl, pct_lbl, fill
+
+        self._job_lbl,    self._job_pct,    self._job_fill    = _bar_widget(bars, "Jobs Progress: 0/1", self.BAR_JOB)
+        self._md5_lbl,    self._md5_pct,    self._md5_fill    = _bar_widget(bars, "Computing MD5: 0/0", self.BAR_MD5)
+        self._up_lbl,     self._up_pct,     self._up_fill     = _bar_widget(bars, "File Upload",        self.BAR_UP)
+
+        # File list area (scrollable-ish via canvas)
+        self._files_frame = _tk.Frame(f, bg=self.CONTENT_BG)
+        self._files_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+    def _build_progress_footer(self, parent):
+        f = _tk.Frame(parent, bg=self.BG)
+        self._prog_footer = f
+        self._cancel_btn = _tk.Button(
+            f, text="Cancel", bg=self.BTN_BG, fg=self.FG,
+            relief="flat", padx=16, pady=7, font=("Segoe UI", 9),
+            cursor="hand2", activebackground="#4a4a4a",
+            command=self._on_cancel)
+        self._cancel_btn.pack(fill="x")
+
+    # ── response tab ──────────────────────────────────────────────────────────
+
+    def _build_response_frame(self):
+        f = _tk.Frame(self._content, bg=self.CONTENT_BG)
+        self._resp_frame = f
+        self._resp_lbl = _tk.Label(
+            f, text="", fg=self.FG, bg=self.CONTENT_BG,
+            font=("Segoe UI", 10), anchor="nw", justify="left", wraplength=680)
+        self._resp_lbl.pack(fill="x", padx=20, pady=20, anchor="nw")
+        self._dash_btn = _tk.Button(
+            f, text="Go to dashboard", bg=self.BTN_BG, fg=self.FG,
+            relief="flat", padx=12, pady=5, font=("Segoe UI", 9),
+            cursor="hand2", command=self._open_dashboard)
+        self._dash_btn.place(relx=1.0, x=-16, y=16, anchor="ne")
+        self._dashboard_url = ""
+
+    def _build_response_footer(self, parent):
+        f = _tk.Frame(parent, bg=self.BG)
+        self._resp_footer = f
+        _tk.Button(f, text="Close", bg=self.BTN_BG, fg=self.FG,
+                   relief="flat", padx=16, pady=7, font=("Segoe UI", 9),
+                   cursor="hand2", activebackground="#4a4a4a",
+                   command=self._on_close_btn).pack(fill="x")
+
+    # ── tab switching ─────────────────────────────────────────────────────────
+
+    def _switch(self, tab):
+        for frame in (self._val_frame, self._prog_frame, self._resp_frame):
+            frame.pack_forget()
+        for footer in (self._val_footer, self._prog_footer, self._resp_footer):
+            footer.pack_forget()
+
+        if tab == "validation":
+            self._val_frame.pack(fill="both", expand=True)
+            self._val_footer.pack(fill="x")
+        elif tab == "progress":
+            self._prog_frame.pack(fill="both", expand=True)
+            self._prog_footer.pack(fill="x")
+        elif tab == "response":
+            self._resp_frame.pack(fill="both", expand=True)
+            self._resp_footer.pack(fill="x")
+
+        self._current_tab = tab
+        for name, btn in self._tab_btns.items():
+            if name == tab:
+                btn.configure(bg=self.ACTIVE_TAB, fg="#ffffff", relief="sunken")
+            else:
+                btn.configure(bg=self.TAB_BG, fg=self.FG, relief="flat")
+
+    # ── state polling (runs every 150 ms on tkinter thread) ───────────────────
+
+    def _poll(self):
+        if self._closed or not self.root:
+            return
+        try:
+            state = _sub.get("state", "IDLE")
+
+            if state == "SUBMITTING":
+                if getattr(self, "_current_tab", "") != "progress":
+                    self._switch("progress")
+                self._refresh_progress()
+
+            elif state in ("COMPLETE", "ERROR"):
+                if getattr(self, "_current_tab", "") != "response":
+                    self._populate_response(state)
+                    self._switch("response")
+        except Exception:
+            pass
+        self.root.after(150, self._poll)
+
+    def _refresh_progress(self):
+        with _sub_lock:
+            md5_total = max(1, _sub.get("md5_total", 1))
+            md5_done  = _sub.get("md5_done", 0)
+            ubt       = _sub.get("upload_bytes_total", 0)
+            ubs       = _sub.get("upload_bytes_sent",  0)
+            jp        = max(0.0, min(1.0, _sub.get("job_progress", 0.0)))
+            files     = list(_sub.get("files", []))
+
+        md5_frac = md5_done / md5_total
+        up_frac  = (ubs / ubt) if ubt > 0 else 0.0
+        up_frac  = max(0.0, min(1.0, up_frac))
+
+        blend_fp   = bpy.data.filepath or "untitled.blend"
+        scene_name = os.path.splitext(os.path.basename(blend_fp))[0]
+        v          = bpy.app.version
+        blender_str = f"Blender {v[0]}.{v[1]}.{v[2]}"
+
+        self._job_lbl.configure(text=f"Jobs Progress: 1/1 – {blender_str} Linux Render {scene_name}")
+        self._job_pct.configure(text=f"{jp*100:.1f}%")
+        self._job_fill.place(relwidth=jp)
+
+        self._md5_lbl.configure(text=f"Computing MD5: {md5_done}/{md5_total}")
+        self._md5_pct.configure(text=f"{md5_frac*100:.1f}%")
+        self._md5_fill.place(relwidth=md5_frac)
+
+        self._up_lbl.configure(text="File Upload")
+        self._up_pct.configure(text=f"{up_frac*100:.1f}%")
+        self._up_fill.place(relwidth=up_frac)
+
+        # Rebuild file rows only when count changes to avoid flicker
+        existing = self._files_frame.winfo_children()
+        if len(existing) != len(files):
+            for w in existing:
+                w.destroy()
+            for fs in files:
+                row = _tk.Frame(self._files_frame, bg=self.CONTENT_BG)
+                row.pack(fill="x", pady=1)
+                _tk.Label(row, text=fs.get("path", fs.get("name", "")),
+                          fg=self.FG_DIM, bg=self.CONTENT_BG,
+                          font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
+                if fs.get("skipped"):
+                    pill, pill_bg = "Cached",  "#333333"
+                elif fs.get("upload_done"):
+                    pill, pill_bg = "100%",    "#1D6B3A"
+                elif fs.get("md5_done"):
+                    fsz = fs.get("size", 1) or 1
+                    pct = int(100 * fs.get("upload_bytes", 0) / fsz)
+                    pill, pill_bg = f"{pct}%", "#1a3a6b"
+                else:
+                    pill, pill_bg = "—",       "#333333"
+                _tk.Label(row, text=pill, fg=self.FG, bg=pill_bg,
+                          font=("Segoe UI", 8, "bold"), padx=6, pady=1).pack(side="right")
+
+    def _populate_response(self, state):
+        if state == "COMPLETE":
+            job_raw = _sub.get("job_number", "0")
+            try:
+                job_padded = str(int(job_raw)).zfill(5)
+            except (ValueError, TypeError):
+                job_padded = str(job_raw)
+            ver = _sub.get("blender_ver_str", "") or f"Blender {'.'.join(str(x) for x in bpy.app.version)}"
+            scene = os.path.splitext(os.path.basename(bpy.data.filepath or "untitled.blend"))[0]
+            text  = f"Job submitted – {ver} Linux Render {scene} ({job_padded})"
+            self._resp_lbl.configure(fg=self.FG, text=text)
+            self._dashboard_url = f"{WEB_BASE}/jobs/{job_padded}"
+            self._dash_btn.pack(side="right", padx=16, pady=16)
+        else:
+            err = _sub.get("error", "Unknown error").split("\n")[0][:200]
+            self._resp_lbl.configure(fg=self.RED, text=f"Submission failed — {err}")
+            self._dash_btn.pack_forget()
+
+    # ── button callbacks ──────────────────────────────────────────────────────
+
+    def _on_save_and_continue(self):
+        self._switch("progress")
+        def _do():
+            bpy.ops.wm.save_mainfile()
+            bpy.ops.rf.start_submission()
+            return None
+        bpy.app.timers.register(_do, first_interval=0.05)
+
+    def _on_continue(self):
+        self._switch("progress")
+        def _do():
+            bpy.ops.rf.start_submission()
+            return None
+        bpy.app.timers.register(_do, first_interval=0.05)
+
+    def _on_cancel(self):
+        with _sub_lock:
+            _sub["cancel"] = True
+        self._cancel_btn.configure(text="Cancelling…", state="disabled")
+
+    def _on_close_btn(self):
+        self._destroy()
+
+    def _open_dashboard(self):
+        import webbrowser as _wb
+        _wb.open(self._dashboard_url or WEB_BASE)
+
+    def _destroy(self):
+        self._closed = True
+        if self.root:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            self.root = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Operators — Submission pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1771,6 +2424,20 @@ class RF_OT_Submit(Operator):
             bv = f"Blender {bv}"
         _sub["blender_ver_str"] = bv
 
+        # ── Open standalone OS window (tkinter) ─────────────────────────────
+        if _TK_AVAILABLE:
+            vi = {
+                "is_dirty":  bpy.data.is_dirty,
+                "no_camera": not scene.camera and not getattr(scene, "rf_camera", "").strip(),
+                "gcp_mode":  _sub.get("gcp_mode", False),
+                "deps":      _sub.get("deps", []),
+                "missing":   _sub.get("missing", []),
+            }
+            win = SubmissionWindow(vi)
+            win.open()
+            return {"FINISHED"}
+
+        # Fallback: Blender native dialog when tkinter is unavailable
         try:
             return context.window_manager.invoke_props_dialog(
                 self, width=700, confirm_text="Close")
@@ -2016,6 +2683,32 @@ class RF_PT_Job(_Base):
         row.prop(scene, "rf_provider", text="")
         layout.separator()
 
+        # ── Notifications section ─────────────────────────────────────────────
+        notif_box = layout.box()
+        notif_row = notif_box.row()
+        notif_row.prop(scene, "rf_show_notifications",
+                       icon="TRIA_DOWN" if scene.rf_show_notifications else "TRIA_RIGHT",
+                       emboss=False, text="")
+        notif_row.label(text="Notifications", icon="WORLD")
+        if scene.rf_show_notifications:
+            notif_box.prop(scene, "rf_notify_email",
+                           text="Email when job completes")
+            if scene.rf_notify_email:
+                em = _get_user_email()
+                if em:
+                    notif_box.label(text=em, icon="MAIL")
+            notif_box.prop(scene, "rf_notify_sound",
+                           text="Sound notification on this device")
+            if scene.rf_notify_sound:
+                notif_box.operator("rf.preview_sound",
+                                   text="Preview Sound", icon="PLAY")
+            notif_box.separator(factor=0.4)
+            notif_box.label(text="Notify on:")
+            row = notif_box.row()
+            row.prop(scene, "rf_notify_on", expand=True)
+
+        layout.separator(factor=0.5)
+
         # ── Project guard — block submission when no active project exists ───
         has_project = scene.rf_project not in ("none", "", None)
         if not has_project:
@@ -2179,7 +2872,7 @@ class RF_PT_AdditionalOptions(_Base):
 CLASSES = [
     RFExtraFileAsset, RFExtraDirAsset, RFEnvVar, RFEnvVarList, RFAddonProp,
     RFPreferences,
-    RF_OT_Connect, RF_OT_Disconnect, RF_OT_PreviewScript,
+    RF_OT_Connect, RF_OT_Disconnect, RF_OT_PreviewScript, RF_OT_PreviewSound,
     RF_OT_Submit, RF_OT_StartSubmission, RF_OT_CancelSubmission,
     RF_OT_SubmitClose, RF_OT_SaveAndContinue, RF_OT_ContinueSubmit,
     RF_OT_OpenDashboard,
@@ -2253,6 +2946,34 @@ def register():
     S.rf_env_vars              = bpy.props.PointerProperty(type=RFEnvVarList)
     S.rf_addon_props           = CollectionProperty(type=RFAddonProp)
 
+    # Notification preferences
+    S.rf_show_notifications = bpy.props.BoolProperty(name="Show Notifications", default=False)
+    S.rf_notify_email       = bpy.props.BoolProperty(
+        name="Email notification when job completes",
+        description="Send an email to your account when this job finishes",
+        default=True,
+    )
+    S.rf_notify_sound       = bpy.props.BoolProperty(
+        name="Sound notification on this device",
+        description="Play a sound on this computer when the job finishes",
+        default=True,
+    )
+    S.rf_notify_on          = bpy.props.EnumProperty(
+        name="Notify on",
+        items=[
+            ("SUCCESS", "Success only",          ""),
+            ("BOTH",    "Success and failure",   ""),
+            ("FAILURE", "Failure only",          ""),
+        ],
+        default="BOTH",
+    )
+
+    # Generate sound files on install
+    try:
+        _ensure_sounds()
+    except Exception as _e:
+        print(f"[Renderfarm] Could not generate sounds: {_e}")
+
     # Auto-restore saved session
     token, email = _load_token()
     if token and email:
@@ -2278,6 +2999,7 @@ def unregister():
         "rf_update_camera_per_frame","rf_render_all_view_layers","rf_status_msg","rf_status_type",
         "rf_extra_files","rf_extra_dirs","rf_env_vars","rf_addon_props",
         "rf_use_tiles","rf_tiles","rf_provider",
+        "rf_show_notifications","rf_notify_email","rf_notify_sound","rf_notify_on",
     ]
     for p in props:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
