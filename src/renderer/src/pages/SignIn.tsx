@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import type { AuthState } from '../App'
 
 const WEB = 'https://renderfarm.swade-art.com'
@@ -19,6 +19,11 @@ export default function SignInPage({ onLogin }: { onLogin: (a: AuthState) => voi
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
+  const [version,  setVersion]  = useState('')
+
+  useEffect(() => {
+    window.rfApi.app.version().then(setVersion).catch(() => setVersion(''))
+  }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -136,7 +141,7 @@ export default function SignInPage({ onLogin }: { onLogin: (a: AuthState) => voi
           </button>
         </p>
 
-        <p className="signin-footer">Renderfarm Companion · v1.0.1</p>
+        <p className="signin-footer">Renderfarm Companion{version ? ` · v${version}` : ''}</p>
         <p className="signin-legal">
           <button type="button" className="signin-legal-link" onClick={() => open('/privacy')}>Privacy Policy</button>
           {' · '}

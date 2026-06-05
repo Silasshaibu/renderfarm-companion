@@ -84,6 +84,8 @@ app.whenReady().then(() => {
   app.setAppUserModelId('com.renderfarm.companion')
 
   // Register IPC handlers after app is ready
+  ipcMain.handle('app:version', () => app.getVersion())
+
   ipcMain.handle('auth:login', async (_e, { email, password }: { email: string; password: string }) => {
     return apiRequest('/auth/login', {
       method: 'POST',

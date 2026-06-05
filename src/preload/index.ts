@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
 const api = {
+  app: {
+    version: () => ipcRenderer.invoke('app:version') as Promise<string>,
+  },
   auth: {
     login: (email: string, password: string) =>
       ipcRenderer.invoke('auth:login', { email, password }),
