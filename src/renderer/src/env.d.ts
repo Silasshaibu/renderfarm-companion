@@ -4,6 +4,7 @@ interface Window {
   rfApi: {
     auth: {
       login: (email: string, password: string) => Promise<{ access_token: string; user: { id: string; email: string; isAdmin: boolean } }>
+      browserLogin: () => Promise<{ token: string; email: string }>
     }
     jobs: {
       list:           (token: string) => Promise<unknown[]>

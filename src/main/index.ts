@@ -1,8 +1,12 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
+import http from 'http'
 import { autoUpdater } from 'electron-updater'
 
 const isDev = process.env.NODE_ENV === 'development'
+
+// Web origin for the browser sign-in flow (must match a Google OAuth JS origin)
+const WEB_BASE = 'https://renderfarm.swade-art.com'
 
 // ── Auto-updater setup ────────────────────────────────────────────────────────
 autoUpdater.autoDownload       = false   // user triggers download manually
@@ -84,6 +88,44 @@ app.whenReady().then(() => {
     return apiRequest('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
+    })
+  })
+
+  // Browser-based sign-in (Google or password) via a localhost callback.
+  // Spins up a one-shot 127.0.0.1 server, opens the web login with ?port=,
+  // and resolves when the web app redirects back with the session token.
+  ipcMain.handle('auth:browserLogin', async () => {
+    return await new Promise<{ token: string; email: string }>((resolve, reject) => {
+      let settled = false
+      const server = http.createServer((req, res) => {
+        try {
+          const u = new URL(req.url || '', 'http://127.0.0.1')
+          if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return }
+          const token = u.searchParams.get('token') || ''
+          const email = u.searchParams.get('email') || ''
+          res.writeHead(200, { 'Content-Type': 'text/html' })
+          res.end('<!doctype html><html><body style="font-family:system-ui;background:#0f1117;color:#e2e8f0;text-align:center;padding-top:80px">'
+            + '<h2 style="color:#22d3ee">✓ Signed in</h2>'
+            + '<p>You can close this tab and return to Renderfarm Companion.</p></body></html>')
+          if (!settled) {
+            settled = true
+            try { server.close() } catch { /* noop */ }
+            if (token) resolve({ token, email })
+            else reject(new Error('No token returned'))
+          }
+        } catch {
+          res.writeHead(500); res.end()
+        }
+      })
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address()
+        const port = typeof addr === 'object' && addr ? addr.port : 0
+        shell.openExternal(`${WEB_BASE}/login?port=${port}`)
+      })
+      server.on('error', (e) => { if (!settled) { settled = true; reject(e) } })
+      setTimeout(() => {
+        if (!settled) { settled = true; try { server.close() } catch { /* noop */ }; reject(new Error('Sign-in timed out')) }
+      }, 5 * 60 * 1000)
     })
   })
 

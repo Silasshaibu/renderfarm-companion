@@ -4,6 +4,8 @@ const api = {
   auth: {
     login: (email: string, password: string) =>
       ipcRenderer.invoke('auth:login', { email, password }),
+    browserLogin: () =>
+      ipcRenderer.invoke('auth:browserLogin') as Promise<{ token: string; email: string }>,
   },
   jobs: {
     list:           (token: string)                      => ipcRenderer.invoke('jobs:list', token),
