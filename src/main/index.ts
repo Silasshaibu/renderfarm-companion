@@ -105,9 +105,10 @@ app.whenReady().then(() => {
           if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return }
           const token = u.searchParams.get('token') || ''
           const email = u.searchParams.get('email') || ''
-          res.writeHead(200, { 'Content-Type': 'text/html' })
-          res.end('<!doctype html><html><body style="font-family:system-ui;background:#0f1117;color:#e2e8f0;text-align:center;padding-top:80px">'
-            + '<h2 style="color:#22d3ee">✓ Signed in</h2>'
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<!doctype html><html><head><meta charset="utf-8"></head>'
+            + '<body style="font-family:system-ui;background:#0f1117;color:#e2e8f0;text-align:center;padding-top:80px">'
+            + '<h2 style="color:#22d3ee">&#10003; Signed in</h2>'
             + '<p>You can close this tab and return to Renderfarm Companion.</p></body></html>')
           if (!settled) {
             settled = true
