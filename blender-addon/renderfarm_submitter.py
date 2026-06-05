@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 1, 1),
+    "version":     (2, 1, 2),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -20,6 +20,7 @@ import hashlib
 import threading
 import webbrowser
 import os
+import re
 import sys
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import StringProperty, CollectionProperty
@@ -672,75 +673,176 @@ def _redraw():
 # ──────────────────────────────────────────────────────────────────────────────
 # Dependency scanner  (fast — reads bpy.data, no file I/O)
 # ──────────────────────────────────────────────────────────────────────────────
+def _expand_numbered_sequence(abs_first):
+    """
+    Given one frame of a numbered sequence, return all sibling frames on disk
+    that share the same prefix/suffix with a numeric run, e.g.
+      smoke_0001.vdb -> [smoke_0001.vdb, smoke_0002.vdb, ...]
+    Falls back to [abs_first] when no pattern is detected.
+    """
+    d    = os.path.dirname(abs_first)
+    name = os.path.basename(abs_first)
+    if not os.path.isdir(d):
+        return [abs_first]
+    m = re.search(r'\d+', name[::-1])   # last run of digits
+    if not m:
+        return [abs_first]
+    # Build a regex: <prefix><digits><suffix>
+    last = list(re.finditer(r'\d+', name))[-1]
+    prefix = re.escape(name[:last.start()])
+    suffix = re.escape(name[last.end():])
+    rx = re.compile(rf'^{prefix}\d+{suffix}$')
+    out = [os.path.join(d, f) for f in os.listdir(d) if rx.match(f)]
+    return sorted(out) or [abs_first]
+
+
 def _scan_deps():
     """
-    Scan bpy.data for all external file dependencies.
+    Scan bpy.data for ALL external file dependencies the scene needs on the farm.
     Returns a list of dep dicts:
-      { type, name, abs_path, rel_path, exists, size }
-    Also includes the .blend file itself as type="blend".
+      { type, name, abs_path, rel_path, exists, size, referenced_by, sha256 }
+    Missing files are included with exists=False (filtered out before upload,
+    surfaced as warnings). The .blend file itself is included as type="blend".
     """
     deps = []
+    seen = set()   # abs_path dedup
 
-    def _add(dep_type, name, filepath):
-        if not filepath:
+    def _add(dep_type, name, filepath, referenced_by="", *, abs_override=None):
+        if not filepath and not abs_override:
             return
-        abs_path = bpy.path.abspath(filepath)
-        rel_path = filepath
-        exists   = os.path.isfile(abs_path)
-        size     = os.path.getsize(abs_path) if exists else 0
+        abs_path = abs_override or bpy.path.abspath(filepath)
+        abs_path = os.path.normpath(abs_path)
+        if abs_path in seen:
+            return
+        seen.add(abs_path)
+        exists = os.path.isfile(abs_path)
+        size   = os.path.getsize(abs_path) if exists else 0
         deps.append({
-            "type":     dep_type,
-            "name":     name,
-            "abs_path": abs_path,
-            "rel_path": rel_path,
-            "exists":   exists,
-            "size":     size,
-            "sha256":   None,   # filled in during SUBMITTING/Step 2
+            "type":          dep_type,
+            "name":          name,
+            "abs_path":      abs_path,
+            "rel_path":      filepath or abs_path,
+            "exists":        exists,
+            "size":          size,
+            "referenced_by": referenced_by,
+            "sha256":        None,   # filled in during SUBMITTING/Step 2
         })
 
-    # Images
+    def _add_sequence(dep_type, name, filepath, referenced_by=""):
+        first = os.path.normpath(bpy.path.abspath(filepath))
+        for f in _expand_numbered_sequence(first):
+            _add(dep_type, os.path.basename(f), filepath, referenced_by, abs_override=f)
+
+    # ── Images (textures, HDRIs, sequences, UDIM tiles) ──────────────────────
     for img in bpy.data.images:
         if img.packed_file:
-            continue   # packed — no external file
-        if img.filepath:
-            _add("image", img.name, img.filepath)
+            continue                       # packed inside the .blend
+        if img.source in ('GENERATED', 'VIEWER'):
+            continue
+        if not img.filepath:
+            continue
+        if img.source == 'SEQUENCE':
+            _add_sequence("image", img.name, img.filepath, f'Image "{img.name}"')
+        elif img.source == 'TILED':        # UDIM
+            base = bpy.path.abspath(img.filepath)
+            added_tile = False
+            for tile in getattr(img, "tiles", []):
+                tile_path = base.replace('<UDIM>', str(tile.number)).replace('1001', str(tile.number))
+                _add("udim", img.name, img.filepath, f'Image "{img.name}"',
+                     abs_override=os.path.normpath(tile_path))
+                added_tile = True
+            if not added_tile:
+                _add("image", img.name, img.filepath, f'Image "{img.name}"')
+        else:
+            _add("image", img.name, img.filepath, f'Image "{img.name}"')
 
-    # Linked libraries
+    # ── Linked libraries (.blend) ────────────────────────────────────────────
     for lib in bpy.data.libraries:
         if lib.filepath:
-            _add("library", lib.name, lib.filepath)
+            _add("library", lib.name, lib.filepath, "Linked library")
 
-    # Fonts
+    # ── Fonts ────────────────────────────────────────────────────────────────
     for font in bpy.data.fonts:
         if font.filepath in ("", "<builtin>"):
             continue
-        _add("font", font.name, font.filepath)
+        _add("font", font.name, font.filepath, f'Font "{font.name}"')
 
-    # Sounds
+    # ── Sounds ───────────────────────────────────────────────────────────────
     for snd in bpy.data.sounds:
+        if getattr(snd, "packed_file", None):
+            continue
         if snd.filepath:
-            _add("sound", snd.name, snd.filepath)
+            _add("sound", snd.name, snd.filepath, f'Sound "{snd.name}"')
 
-    # Cache files (Alembic, VDB, etc.)
+    # ── Cache files (Alembic / USD CacheFile datablocks) ─────────────────────
     for cf in bpy.data.cache_files:
         if cf.filepath:
-            _add("cache", cf.name, cf.filepath)
+            _add("cache", cf.name, cf.filepath, "Cache file")
 
-    # The .blend itself
+    # ── OpenVDB volumes (single + sequences) ─────────────────────────────────
+    for vol in getattr(bpy.data, "volumes", []):
+        if not vol.filepath:
+            continue
+        if getattr(vol, "is_sequence", False):
+            _add_sequence("vdb", vol.name, vol.filepath, f'Volume "{vol.name}"')
+        else:
+            _add("vdb", vol.name, vol.filepath, f'Volume "{vol.name}"')
+
+    # ── Movie clips ──────────────────────────────────────────────────────────
+    for clip in bpy.data.movieclips:
+        if not clip.filepath:
+            continue
+        if clip.source == 'SEQUENCE':
+            _add_sequence("image", clip.name, clip.filepath, f'Movie clip "{clip.name}"')
+        else:
+            _add("movie", clip.name, clip.filepath, f'Movie clip "{clip.name}"')
+
+    # ── External text/script datablocks ──────────────────────────────────────
+    for txt in bpy.data.texts:
+        if getattr(txt, "filepath", ""):
+            _add("script", txt.name, txt.filepath, f'Text "{txt.name}"')
+
+    # ── Modifier mesh caches (.mdd/.pc2) — not datablocks ────────────────────
+    for obj in bpy.data.objects:
+        for mod in getattr(obj, "modifiers", []):
+            if mod.type == 'MESH_CACHE' and getattr(mod, "filepath", ""):
+                _add("mesh_cache", f"{obj.name} cache", mod.filepath,
+                     f'Object "{obj.name}" Mesh Cache')
+
+    # ── VSE strips (sound/movie/image) ───────────────────────────────────────
+    for scn in bpy.data.scenes:
+        se = getattr(scn, "sequence_editor", None)
+        if not se:
+            continue
+        for strip in se.sequences_all:
+            stype = getattr(strip, "type", "")
+            if stype == 'SOUND' and getattr(strip, "filepath", ""):
+                _add("sound", strip.name, strip.filepath, f'VSE strip "{strip.name}"')
+            elif stype == 'MOVIE' and getattr(strip, "filepath", ""):
+                _add("movie", strip.name, strip.filepath, f'VSE strip "{strip.name}"')
+            elif stype == 'IMAGE' and getattr(strip, "directory", ""):
+                for elem in getattr(strip, "elements", []):
+                    p = os.path.join(bpy.path.abspath(strip.directory), elem.filename)
+                    _add("image", elem.filename, None, f'VSE strip "{strip.name}"',
+                         abs_override=os.path.normpath(p))
+
+    # ── The .blend itself ────────────────────────────────────────────────────
     blend_path = bpy.context.blend_data.filepath
     if blend_path:
-        abs_blend = os.path.abspath(blend_path)
-        exists    = os.path.isfile(abs_blend)
-        size      = os.path.getsize(abs_blend) if exists else 0
-        deps.append({
-            "type":     "blend",
-            "name":     os.path.basename(abs_blend),
-            "abs_path": abs_blend,
-            "rel_path": blend_path,
-            "exists":   exists,
-            "size":     size,
-            "sha256":   None,
-        })
+        abs_blend = os.path.normpath(os.path.abspath(blend_path))
+        if abs_blend not in seen:
+            seen.add(abs_blend)
+            exists = os.path.isfile(abs_blend)
+            deps.append({
+                "type":          "blend",
+                "name":          os.path.basename(abs_blend),
+                "abs_path":      abs_blend,
+                "rel_path":      blend_path,
+                "exists":        exists,
+                "size":          os.path.getsize(abs_blend) if exists else 0,
+                "referenced_by": "Main scene file",
+                "sha256":        None,
+            })
 
     return deps
 
@@ -912,6 +1014,16 @@ def _run_submission(scene_props, token, blend_path, payload):
 
         deps       = _sub["deps"]
         uploadable = [d for d in deps if d["exists"]]
+
+        # Surface missing (referenced-but-not-found) files as warnings
+        missing = [d for d in deps if not d["exists"]]
+        if missing:
+            _log(f"⚠ {len(missing)} referenced file(s) not found on disk — they will NOT be uploaded:")
+            for d in missing[:20]:
+                ref = d.get("referenced_by") or d["type"]
+                _log(f"    ✗ {d['rel_path']}  ({ref})")
+            if len(missing) > 20:
+                _log(f"    …and {len(missing) - 20} more")
 
         # Build per-file state list that drives the UI rows
         files_state = []
