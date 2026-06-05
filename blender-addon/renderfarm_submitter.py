@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 1, 0),
+    "version":     (2, 1, 1),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -1029,6 +1029,11 @@ def _run_submission(scene_props, token, blend_path, payload):
         with _sub_lock:
             _sub["job_number"] = str(job_number)
             _sub["job_id"]     = str(job_id)
+            # If server held the job due to insufficient credits, flag it
+            if result.get("held"):
+                _sub["credit_hold"]   = True
+                _sub["credit_msg"]    = result.get("message", "No credits remaining.")
+                _sub["credit_balance"] = result.get("balance", 0)
         _log(f"Job {job_number} created — uploading {len(to_upload)} files…")
         _bump_progress(0.45)
 
@@ -1125,17 +1130,22 @@ def _run_submission(scene_props, token, blend_path, payload):
         resolved_manifest = dict(manifest)
         resolved_manifest["assets"] = resolved_assets
 
+        # If credit hold, keep job in holding — don't push it to pending
+        final_status = "holding" if _sub.get("credit_hold") else "pending"
         _patch(
             f"/jobs?id={job_id}",
             {
-                "status":          "pending",
+                "status":          final_status,
                 "assets_uploaded": uploaded + skipped,
                 "manifest":        resolved_manifest,
             },
             token,
         )
 
-        _log(f"Done — {uploaded} uploaded, {skipped} already cached")
+        if _sub.get("credit_hold"):
+            _log("Files uploaded — job is ON HOLD (no credits).")
+        else:
+            _log(f"Done — {uploaded} uploaded, {skipped} already cached")
 
         with _sub_lock:
             _sub["state"]      = "COMPLETE"
@@ -2273,12 +2283,30 @@ class SubmissionWindow:
                 job_padded = str(int(job_raw)).zfill(5)
             except (ValueError, TypeError):
                 job_padded = str(job_raw)
-            ver = _sub.get("blender_ver_str", "") or f"Blender {'.'.join(str(x) for x in bpy.app.version)}"
-            scene = os.path.splitext(os.path.basename(bpy.data.filepath or "untitled.blend"))[0]
-            text  = f"Job submitted – {ver} Linux Render {scene} ({job_padded})"
-            self._resp_lbl.configure(fg=self.FG, text=text)
-            self._dashboard_url = f"{WEB_BASE}/jobs/{job_padded}"
-            self._dash_btn.pack(side="right", padx=16, pady=16)
+
+            # Credit hold — files uploaded but job is waiting for credits
+            if _sub.get("credit_hold"):
+                balance = _sub.get("credit_balance", 0)
+                msg = _sub.get("credit_msg", "No credits remaining.")
+                text = (
+                    f"⚠  Files uploaded — Job {job_padded} is ON HOLD\n\n"
+                    f"{msg}\n\n"
+                    f"Current balance: ${float(balance):.2f}\n\n"
+                    f"Add credits on your dashboard then Unhold the job to start rendering.\n"
+                    f"An email has been sent to your account with instructions."
+                )
+                self._resp_lbl.configure(fg="#e8a020", text=text)
+                self._dashboard_url = f"{WEB_BASE}/billing"
+                self._dash_btn.configure(text="Add Credits →")
+                self._dash_btn.pack(side="right", padx=16, pady=16)
+            else:
+                ver = _sub.get("blender_ver_str", "") or f"Blender {'.'.join(str(x) for x in bpy.app.version)}"
+                scene = os.path.splitext(os.path.basename(bpy.data.filepath or "untitled.blend"))[0]
+                text  = f"Job submitted – {ver} Linux Render {scene} ({job_padded})"
+                self._resp_lbl.configure(fg=self.FG, text=text)
+                self._dashboard_url = f"{WEB_BASE}/jobs/{job_padded}"
+                self._dash_btn.configure(text="Go to dashboard")
+                self._dash_btn.pack(side="right", padx=16, pady=16)
         else:
             err = _sub.get("error", "Unknown error").split("\n")[0][:200]
             self._resp_lbl.configure(fg=self.RED, text=f"Submission failed — {err}")
@@ -2363,6 +2391,9 @@ class RF_OT_Submit(Operator):
             _sub["failed_step"] = 0
             _sub["cancel"]         = False
             _sub["gcp_mode"]       = False
+            _sub["credit_hold"]    = False
+            _sub["credit_msg"]     = ""
+            _sub["credit_balance"] = 0
             _sub["frame_spec"]     = ""
             _sub["frame_count"]    = ""
             _sub["task_count"]     = ""
