@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Renderfarm Render Submitter",
     "author":      "Renderfarm",
-    "version":     (2, 1, 2),
+    "version":     (2, 1, 3),
     "blender":     (3, 0, 0),
     "location":    "Properties > Render > Renderfarm Render Submitter",
     "description": "Submit render jobs to Renderfarm directly from Blender",
@@ -1313,68 +1313,166 @@ def _run_gcp_submission(scene_props, token, blend_path, payload):
 
     try:
         filename = os.path.basename(blend_path)
+        deps = _sub.get("deps", [])
+        # Dependency assets = everything that exists EXCEPT the .blend (→ GCS)
+        uploadable = [d for d in deps if d["exists"] and d["type"] != "blend"]
 
-        # ── Step 1: Upload .blend to GCS ─────────────────────────────────────
+        # Surface missing (referenced-but-not-found) files
+        missing = [d for d in deps if not d["exists"]]
+        if missing:
+            _log(f"⚠ {len(missing)} referenced file(s) not found — they will NOT be uploaded:")
+            for d in missing[:20]:
+                _log(f"    ✗ {d['rel_path']}")
+
+        # Per-file state drives the redesigned Progress tab rows
+        files_state = [{
+            "dep": dep, "path": dep["abs_path"], "name": dep["name"], "size": dep["size"],
+            "hash": None, "md5_done": False, "upload_done": False,
+            "upload_bytes": 0, "skipped": False,
+        } for dep in uploadable]
+        with _sub_lock:
+            _sub["files"]      = files_state
+            _sub["md5_total"]  = len(files_state)
+            _sub["md5_done"]   = 0
+            _sub["sub_status"] = "md5" if files_state else "uploading"
+
+        # ── Hash dependencies (parallel) ─────────────────────────────────────
+        hash_lock = threading.Lock()
+        def _hash_file(fs):
+            if _sub.get("cancel"):
+                raise InterruptedError("Cancelled")
+            sha = _sha256_file(fs["path"])
+            fs["dep"]["sha256"] = sha; fs["hash"] = sha; fs["md5_done"] = True
+            with hash_lock, _sub_lock:
+                _sub["md5_done"] += 1
+            bpy.app.timers.register(_redraw, first_interval=0.05)
+        if files_state:
+            _log(f"Hashing {len(files_state)} dependencies…")
+            with ThreadPoolExecutor(max_workers=min(8, len(files_state))) as pool:
+                for fut in as_completed([pool.submit(_hash_file, fs) for fs in files_state]):
+                    if _sub.get("cancel"):
+                        raise InterruptedError("Cancelled")
+                    fut.result()
+
+        # ── Preflight dedup ──────────────────────────────────────────────────
+        sha256_to_url = {}
+        to_upload = list(files_state)
+        if files_state:
+            pf = _post("/jobs/preflight", {"assets": [{"sha256": fs["hash"]} for fs in files_state]}, token)
+            missing_set = set(pf.get("missing", []))
+            for fs in files_state:
+                if fs["hash"] not in missing_set:
+                    fs["skipped"] = True; fs["upload_done"] = True
+            to_upload = [fs for fs in files_state if not fs["skipped"]]
+
+        # ── Upload the .blend to GCS ─────────────────────────────────────────
         _set_step(1)
         _log(f"Uploading {filename} to cloud storage…")
-        with _sub_lock:
-            _sub["file_total"]    = 1
-            _sub["file_idx"]      = 1
-            _sub["file_name"]     = filename
-            _sub["file_progress"] = 0.0
-        bpy.app.timers.register(_redraw, first_interval=0.05)
-
         def _gcs_prog(frac):
             with _sub_lock:
-                _sub["file_progress"] = frac
-                _sub["step_progress"] = frac
+                _sub["file_progress"] = frac; _sub["step_progress"] = frac
             bpy.app.timers.register(_redraw, first_interval=0.05)
-
         if _sub.get("cancel"):
             raise InterruptedError("Cancelled")
-
         gcs_path = _upload_blend_to_gcs(blend_path, token, progress_cb=_gcs_prog)
-        _log(f"Uploaded → {gcs_path}")
-
+        _log(f"Uploaded scene → {gcs_path}")
         with _sub_lock:
             _sub["step_states"][1] = "done"
-            _sub["step_progress"]  = 1.0
-            _sub["file_progress"]  = 1.0
-        bpy.app.timers.register(_redraw, first_interval=0.05)
 
-        if _sub.get("cancel"):
-            raise InterruptedError("Cancelled")
+        # ── Upload dependency assets to blob (parallel) ──────────────────────
+        with _sub_lock:
+            _sub["sub_status"]         = "uploading"
+            _sub["upload_total"]       = len(to_upload)
+            _sub["upload_bytes_total"] = sum(fs["size"] for fs in to_upload)
+            _sub["upload_bytes_sent"]  = 0
+        upload_lock = threading.Lock()
+        uploaded = 0
+        def _upload_file(fs):
+            nonlocal uploaded
+            if _sub.get("cancel"):
+                raise InterruptedError("Cancelled")
+            def _prog(frac, _fs=fs):
+                _fs["upload_bytes"] = int(frac * _fs["size"])
+                with _sub_lock:
+                    _sub["upload_bytes_sent"] = sum(f["upload_bytes"] for f in files_state)
+                bpy.app.timers.register(_redraw, first_interval=0.05)
+            url = _upload_asset(fs["path"], fs["hash"], token, filename=fs["name"], progress_cb=_prog)
+            fs["upload_done"] = True; fs["upload_bytes"] = fs["size"]
+            with upload_lock:
+                uploaded += 1
+                sha256_to_url[fs["hash"]] = url or ""
+                with _sub_lock:
+                    _sub["upload_done"] = uploaded
+            bpy.app.timers.register(_redraw, first_interval=0.05)
 
-        # ── Step 2: Create job (VMs auto-dispatch inside the API) ─────────────
+        # Resolve cached URLs for already-deduplicated files
+        for fs in files_state:
+            if fs["skipped"]:
+                try:
+                    r = _post("/assets?action=token",
+                              {"sha256": fs["hash"], "filename": fs["name"], "size_bytes": fs["size"]}, token)
+                    if r.get("exists") and r.get("url"):
+                        sha256_to_url[fs["hash"]] = r["url"]
+                except Exception:
+                    pass
+
+        if to_upload:
+            _log(f"Uploading {len(to_upload)} dependencies…")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                for fut in as_completed([pool.submit(_upload_file, fs) for fs in to_upload]):
+                    if _sub.get("cancel"):
+                        raise InterruptedError("Cancelled")
+                    fut.result()
+
+        # ── Build manifest (resolved blob URLs) ──────────────────────────────
+        v  = bpy.app.version
+        fr = scene_props.get("frames", "1-1").replace(" ", "").split("-")
+        manifest = {
+            "scene":           filename,
+            "blender_version": f"{v[0]}.{v[1]}.{v[2]}",
+            "renderer":        scene_props.get("render_software", "Cycles"),
+            "frame_start":     int(fr[0]),
+            "frame_end":       int(fr[-1]) if len(fr) > 1 else int(fr[0]),
+            "chunk_size":      scene_props.get("chunk_size", 1),
+            "assets": [
+                {"path": fs["dep"]["rel_path"], "sha256": fs["hash"],
+                 "size_bytes": fs["size"], "type": fs["dep"]["type"],
+                 "blob_url": sha256_to_url.get(fs["hash"], "")}
+                for fs in files_state
+            ],
+        }
+
+        # ── Create job (server auto-dispatches render VMs) ───────────────────
         _set_step(2)
         _log("Creating job and dispatching render VMs…")
-        bpy.app.timers.register(_redraw, first_interval=0.05)
-
         submit_payload = dict(payload)
         submit_payload["provider"]       = "gcp"
         submit_payload["gcs_scene_path"] = gcs_path
-        # Strip renderfarm-only keys that confuse the API for GCP jobs
-        for k in ("status", "manifest", "assets_total"):
-            submit_payload.pop(k, None)
+        submit_payload["manifest"]       = manifest
+        submit_payload["assets_total"]   = len(uploadable)
+        submit_payload.pop("status", None)
 
         result     = _post("/jobs", submit_payload, token)
         job_number = result.get("jobNumber", "?")
         job_id     = result.get("id", "")
 
         with _sub_lock:
-            _sub["job_number"]     = str(job_number)
-            _sub["job_id"]         = str(job_id)
-            _sub["step_states"][2] = "done"
-            _sub["step_states"][3] = "done"   # N/A for GCP
-            _sub["step_states"][4] = "done"   # N/A for GCP
-            _sub["step_progress"]  = 1.0
+            _sub["job_number"] = str(job_number)
+            _sub["job_id"]     = str(job_id)
+            for k in _sub["step_states"]:
+                _sub["step_states"][k] = "done"
+            if result.get("held"):
+                _sub["credit_hold"]    = True
+                _sub["credit_msg"]     = result.get("message", "No credits remaining.")
+                _sub["credit_balance"] = result.get("balance", 0)
         _log(f"Job {job_number} dispatched — VMs starting…")
-        bpy.app.timers.register(_redraw, first_interval=0.05)
 
         with _sub_lock:
-            _sub["state"]    = "COMPLETE"
-            _sub["uploaded"] = 1
-            _sub["skipped"]  = 0
+            _sub["state"]        = "COMPLETE"
+            _sub["uploaded"]     = uploaded
+            _sub["skipped"]      = len(files_state) - len(to_upload)
+            _sub["job_progress"] = 1.0
+            _sub["sub_status"]   = "done"
         bpy.app.timers.register(_redraw, first_interval=0.05)
 
         # Start job poller for sound/popup notification
@@ -1431,6 +1529,22 @@ def _fmt_size(size_bytes):
     if size_bytes >= 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes} B"
+
+
+# Dependency type → short row tag + group display name (ASCII for reliable tkinter render)
+_TYPE_TAG = {
+    "blend": "SCENE", "image": "IMG", "udim": "UDIM", "library": "LIB",
+    "cache": "CACHE", "alembic": "CACHE", "mesh_cache": "CACHE", "vdb": "VDB",
+    "font": "FONT", "sound": "SND", "movie": "MOV", "script": "TXT",
+}
+_TYPE_GROUP = {
+    "blend": "Scene File", "image": "Textures", "udim": "UDIM Tiles",
+    "library": "Linked Libraries", "cache": "Caches", "alembic": "Caches",
+    "mesh_cache": "Mesh Caches", "vdb": "Volumes", "font": "Fonts",
+    "sound": "Sounds", "movie": "Movies", "script": "Scripts",
+}
+def _type_tag(t):   return _TYPE_TAG.get(t, "FILE")
+def _type_group(t): return _TYPE_GROUP.get(t, "Other")
 
 
 def _draw_validation(layout):
@@ -2177,31 +2291,61 @@ class SubmissionWindow:
                           font=("Segoe UI", 9), anchor="w", justify="left",
                           wraplength=580).pack(fill="x", pady=(3, 0))
 
-        # Asset summary
+        # Asset summary — grouped by type, with a missing-files panel.
         deps    = vi.get("deps", [])
-        missing = vi.get("missing", [])
-        if not vi.get("gcp_mode") and deps:
-            total_bytes = sum(d.get("size", 0) for d in deps if d.get("exists"))
-            summary_txt = (f"Found {len(deps)} assets  ({_fmt_size(total_bytes)} total)  —  "
-                           f"{len(missing)} missing" if missing else
-                           f"Found {len(deps)} assets  ({_fmt_size(total_bytes)} total)  —  All found")
-            _tk.Label(f, text=summary_txt, fg=self.FG_DIM, bg=self.CONTENT_BG,
-                      font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=16, pady=(8, 2))
-            # List up to 8 deps
+        present = [d for d in deps if d.get("exists")]
+        missing = [d for d in deps if not d.get("exists")] or vi.get("missing", [])
+        if deps:
+            total_bytes = sum(d.get("size", 0) for d in present)
+            _tk.Label(f, text=f"Found {len(present)} files  ({_fmt_size(total_bytes)} total)"
+                              + (f"  —  {len(missing)} missing" if missing else "  —  all found"),
+                      fg=self.FG_DIM, bg=self.CONTENT_BG, font=("Segoe UI", 9, "bold"),
+                      anchor="w").pack(fill="x", padx=16, pady=(8, 4))
+
             list_frame = _tk.Frame(f, bg="#252525")
             list_frame.pack(fill="x", padx=16, pady=(0, 8))
-            for dep in deps[:8]:
-                row = _tk.Frame(list_frame, bg="#252525")
-                row.pack(fill="x", padx=8, pady=1)
-                col = "#e05555" if not dep.get("exists") else self.FG
-                _tk.Label(row, text=dep.get("name", ""), fg=col, bg="#252525",
-                          font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
-                size_txt = "NOT FOUND" if not dep.get("exists") else _fmt_size(dep.get("size", 0))
-                _tk.Label(row, text=size_txt, fg=col, bg="#252525",
-                          font=("Segoe UI", 8), anchor="e").pack(side="right")
-            if len(deps) > 8:
-                _tk.Label(list_frame, text=f"… and {len(deps)-8} more", fg=self.FG_DIM,
-                          bg="#252525", font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=8, pady=2)
+
+            # Group present files by type
+            groups = {}
+            for d in present:
+                groups.setdefault(d.get("type", "file"), []).append(d)
+
+            for gtype in sorted(groups, key=lambda t: _type_group(t)):
+                items = groups[gtype]
+                gsize = sum(d.get("size", 0) for d in items)
+                _tk.Label(list_frame,
+                          text=f"{_type_group(gtype).upper()} ({len(items)}) · {_fmt_size(gsize)}",
+                          fg="#7fb0ff", bg="#252525", font=("Segoe UI", 8, "bold"),
+                          anchor="w").pack(fill="x", padx=8, pady=(6, 1))
+                for dep in items[:6]:
+                    row = _tk.Frame(list_frame, bg="#252525")
+                    row.pack(fill="x", padx=14, pady=1)
+                    _tk.Label(row, text=f"[{_type_tag(gtype)}] {dep.get('name','')}",
+                              fg=self.FG, bg="#252525", font=("Segoe UI", 8),
+                              anchor="w").pack(side="left", fill="x", expand=True)
+                    _tk.Label(row, text=_fmt_size(dep.get("size", 0)), fg=self.FG_DIM,
+                              bg="#252525", font=("Segoe UI", 8), anchor="e").pack(side="right")
+                if len(items) > 6:
+                    _tk.Label(list_frame, text=f"      … and {len(items)-6} more",
+                              fg=self.FG_DIM, bg="#252525", font=("Segoe UI", 8),
+                              anchor="w").pack(fill="x", padx=14)
+
+            # Missing-files panel
+            if missing:
+                mf = _tk.Frame(f, bg="#3a2020")
+                mf.pack(fill="x", padx=16, pady=(0, 8))
+                _tk.Label(mf, text=f"⚠ {len(missing)} missing file(s) — will NOT be uploaded; "
+                                   f"render may fail if required",
+                          fg="#ff9b9b", bg="#3a2020", font=("Segoe UI", 8, "bold"),
+                          anchor="w", justify="left", wraplength=580).pack(fill="x", padx=8, pady=(6, 2))
+                for dep in missing[:8]:
+                    ref = dep.get("referenced_by") or dep.get("type", "")
+                    _tk.Label(mf, text=f"✗ {dep.get('rel_path', dep.get('name',''))}  ({ref})",
+                              fg="#e05555", bg="#3a2020", font=("Segoe UI", 8),
+                              anchor="w", justify="left", wraplength=580).pack(fill="x", padx=14, pady=1)
+                if len(missing) > 8:
+                    _tk.Label(mf, text=f"      … and {len(missing)-8} more", fg="#e05555",
+                              bg="#3a2020", font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=14, pady=(0, 4))
 
     def _build_validation_footer(self, parent):
         f = _tk.Frame(parent, bg=self.BG)
@@ -2364,15 +2508,19 @@ class SubmissionWindow:
         self._up_pct.configure(text=f"{up_frac*100:.1f}%")
         self._up_fill.place(relwidth=up_frac)
 
-        # Rebuild file rows only when count changes to avoid flicker
+        # Rebuild file rows only when count changes to avoid flicker.
+        # Sort by type so same-type files cluster; prefix each row with a type tag.
+        files = sorted(files, key=lambda fs: (_type_group(fs.get("dep", {}).get("type", "")),
+                                              fs.get("name", "")))
         existing = self._files_frame.winfo_children()
         if len(existing) != len(files):
             for w in existing:
                 w.destroy()
             for fs in files:
+                ftype = fs.get("dep", {}).get("type", "file")
                 row = _tk.Frame(self._files_frame, bg=self.CONTENT_BG)
                 row.pack(fill="x", pady=1)
-                _tk.Label(row, text=fs.get("path", fs.get("name", "")),
+                _tk.Label(row, text=f"[{_type_tag(ftype)}] {fs.get('name', '')}",
                           fg=self.FG_DIM, bg=self.CONTENT_BG,
                           font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
                 if fs.get("skipped"):
