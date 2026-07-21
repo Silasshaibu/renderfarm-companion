@@ -14,6 +14,12 @@ const api = {
     list:           (token: string)                      => ipcRenderer.invoke('jobs:list', token),
     create:         (token: string, data: object)        => ipcRenderer.invoke('jobs:create', { token, data }),
     refreshOutputs: (token: string, jobNumber: string)   => ipcRenderer.invoke('jobs:refreshOutputs', { token, jobNumber }),
+    submitWithScene: (params: {
+      token: string; data: Record<string, unknown>
+      sceneFilePath: string; assetFilePaths: string[]
+      frameStart: number; frameEnd: number; chunkSize: number
+      renderer: string; blenderVersion: string; gpuEnabled: boolean
+    }) => ipcRenderer.invoke('jobs:submitWithScene', params) as Promise<{ jobNumber: string; id: string }>,
   },
   projects: {
     list: (token: string) => ipcRenderer.invoke('projects:list', token),
@@ -36,6 +42,10 @@ const api = {
     }) => ipcRenderer.invoke('gcp:submit', params) as Promise<{ jobNumber: string; id: string }>,
     onUploadProgress: (cb: (pct: number) => void) =>
       ipcRenderer.on('gcp:uploadProgress', (_e, pct) => cb(pct)),
+  },
+  assets: {
+    onUploadProgress: (cb: (data: { index: number; total: number; filename: string; pct: number; phase: string }) => void) =>
+      ipcRenderer.on('assets:uploadProgress', (_e, data) => cb(data)),
   },
   submission: {
     load: () =>

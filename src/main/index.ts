@@ -153,6 +153,182 @@ app.whenReady().then(() => {
     })
   })
 
+  // ── Local-worker submit: hash + upload the scene file (and any extra assets)
+  // through the same preflight → token → PUT → confirm flow the Blender addon
+  // uses, build a real per-asset manifest, then create the job. Without this,
+  // a "Renderfarm" (non-GCP) submission had no way to get a scene file onto the
+  // server at all — the job was created with an empty manifest and the Python
+  // worker immediately failed it ("No scene file found").
+  ipcMain.handle('jobs:submitWithScene', async (_e, params: {
+    token: string
+    data: Record<string, unknown>
+    sceneFilePath: string
+    assetFilePaths: string[]
+    frameStart: number
+    frameEnd: number
+    chunkSize: number
+    renderer: string
+    blenderVersion: string
+    gpuEnabled: boolean
+  }) => {
+    const fs     = await import('fs')
+    const path   = await import('path')
+    const crypto = await import('crypto')
+    const https  = await import('https')
+    const { URL } = await import('url')
+
+    const {
+      token, data, sceneFilePath, assetFilePaths,
+      frameStart, frameEnd, chunkSize, renderer, blenderVersion, gpuEnabled,
+    } = params
+
+    if (!sceneFilePath) {
+      throw new Error('No scene file selected. Pick a scene file in the FILES tab before submitting.')
+    }
+    if (!fs.existsSync(sceneFilePath)) {
+      throw new Error(`Scene file not found on disk: ${sceneFilePath}. Re-select it in the FILES tab.`)
+    }
+    for (const p of assetFilePaths) {
+      if (!fs.existsSync(p)) {
+        throw new Error(`Asset file not found on disk: ${p}. Remove it or re-select it in the FILES tab.`)
+      }
+    }
+
+    // ── SHA-256 a file, streaming so large scenes don't get buffered in memory ──
+    const sha256File = (p: string): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const hash   = crypto.createHash('sha256')
+        const stream = fs.createReadStream(p)
+        stream.on('data',  (chunk) => hash.update(chunk as Buffer))
+        stream.on('end',   () => resolve(hash.digest('hex')))
+        stream.on('error', reject)
+      })
+
+    const inferType = (p: string): string => {
+      const ext = path.extname(p).toLowerCase()
+      if (['.png', '.jpg', '.jpeg', '.exr', '.tif', '.tiff', '.hdr', '.tga', '.webp'].includes(ext)) return 'image'
+      if (ext === '.blend' || ext === '.blend1') return 'library'
+      return 'asset'
+    }
+
+    // First entry is always the primary scene file — flagged type "blend" so the
+    // worker's `next(a for a in assets if a.get("type") == "blend")` check finds it,
+    // matching the manifest contract the Blender addon produces.
+    const allFiles = [
+      { absPath: sceneFilePath, type: 'blend' },
+      ...assetFilePaths.map((p) => ({ absPath: p, type: inferType(p) })),
+    ]
+
+    // 1. Stat + hash every file up front
+    const filesState = await Promise.all(allFiles.map(async (f) => {
+      const stat   = fs.statSync(f.absPath)
+      const sha256 = await sha256File(f.absPath)
+      return { ...f, name: path.basename(f.absPath), size: stat.size, sha256 }
+    }))
+
+    // 2. Preflight — ask the server which of these hashes it doesn't have yet
+    const total = filesState.length
+    getMainWindow()?.webContents.send('assets:uploadProgress', {
+      index: 0, total, filename: '', pct: 0, phase: 'preflight',
+    })
+    await apiRequest('/jobs/preflight', {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+      body:    JSON.stringify({ assets: filesState.map((f) => ({ sha256: f.sha256 })) }),
+    })
+
+    // 3. For each file: get a client upload token (or the cached URL if the
+    //    asset already exists), PUT the bytes to Vercel Blob if needed, confirm.
+    const sha256ToUrl: Record<string, string> = {}
+
+    for (let i = 0; i < filesState.length; i++) {
+      const f = filesState[i]
+      getMainWindow()?.webContents.send('assets:uploadProgress', {
+        index: i, total, filename: f.name, pct: 0, phase: 'uploading',
+      })
+
+      const tokenResp = await apiRequest('/assets?action=token', {
+        method:  'POST',
+        headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+        body:    JSON.stringify({ sha256: f.sha256, filename: f.name, size_bytes: f.size }),
+      })
+
+      if (tokenResp.exists) {
+        sha256ToUrl[f.sha256] = tokenResp.url
+      } else {
+        const clientToken: string = tokenResp.clientToken
+        const uploadUrl:   string = tokenResp.uploadUrl
+
+        await new Promise<void>((resolve, reject) => {
+          const url = new URL(uploadUrl)
+          let uploaded = 0
+          const req = https.request({
+            hostname: url.hostname,
+            path:     url.pathname + url.search,
+            method:   'PUT',
+            headers:  {
+              'Authorization':   `Bearer ${clientToken}`,
+              'Content-Type':    'application/octet-stream',
+              'Content-Length':  f.size,
+              'x-content-type':  'application/octet-stream',
+            },
+          }, (res) => {
+            res.resume()
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve()
+            else reject(new Error(`Asset upload failed for ${f.name}: HTTP ${res.statusCode}`))
+          })
+          req.on('error', reject)
+
+          const fileStream = fs.createReadStream(f.absPath)
+          fileStream.on('data', (chunk) => {
+            uploaded += (chunk as Buffer).length
+            const pct = f.size > 0 ? Math.round((uploaded / f.size) * 100) : 100
+            getMainWindow()?.webContents.send('assets:uploadProgress', {
+              index: i, total, filename: f.name, pct, phase: 'uploading',
+            })
+          })
+          fileStream.pipe(req)
+        })
+
+        await apiRequest('/assets?action=confirm', {
+          method:  'POST',
+          headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+          body:    JSON.stringify({ sha256: f.sha256, url: uploadUrl, filename: f.name, size_bytes: f.size }),
+        })
+        sha256ToUrl[f.sha256] = uploadUrl
+      }
+    }
+
+    getMainWindow()?.webContents.send('assets:uploadProgress', {
+      index: total, total, filename: '', pct: 100, phase: 'done',
+    })
+
+    // 4. Build the manifest the render worker expects (v7 format)
+    const manifest = {
+      scene:           filesState[0].name,
+      blender_version: blenderVersion || '',
+      renderer:        renderer || '',
+      instance_type:   gpuEnabled ? 'GPU' : 'CPU',
+      frame_start:     frameStart,
+      frame_end:       frameEnd,
+      chunk_size:      chunkSize,
+      assets: filesState.map((f) => ({
+        path:       f.name,
+        sha256:     f.sha256,
+        size_bytes: f.size,
+        type:       f.type,
+        blob_url:   sha256ToUrl[f.sha256] || '',
+      })),
+    }
+
+    // 5. Create the job with the resolved manifest attached
+    return apiRequest('/jobs', {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}` } as HeadersInit,
+      body:    JSON.stringify({ ...data, manifest }),
+    })
+  })
+
   ipcMain.handle('projects:list', async (_e, token: string) => {
     return apiRequest('/projects', {
       headers: { Authorization: `Bearer ${token}` } as HeadersInit,
@@ -171,9 +347,14 @@ app.whenReady().then(() => {
   // ── File picker ──────────────────────────────────────────────────────────────
   ipcMain.handle('dialog:pickFile', async (_e, { title, extensions }: { title: string; extensions: string[] }) => {
     const { dialog } = await import('electron')
+    // An empty extensions list means "any file" — Electron needs an explicit
+    // wildcard filter for that rather than an empty extensions array.
+    const filters = extensions && extensions.length > 0
+      ? [{ name: 'Files', extensions }]
+      : [{ name: 'All Files', extensions: ['*'] }]
     const { filePaths } = await dialog.showOpenDialog({
       title,
-      filters: [{ name: 'Files', extensions }],
+      filters,
       properties: ['openFile'],
     })
     return filePaths[0] ?? null

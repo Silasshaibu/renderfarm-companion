@@ -13,6 +13,12 @@ interface Window {
       list:           (token: string) => Promise<unknown[]>
       create:         (token: string, data: object) => Promise<{ jobNumber: string }>
       refreshOutputs: (token: string, jobNumber: string) => Promise<{ ok: boolean; count: number }>
+      submitWithScene: (params: {
+        token: string; data: Record<string, unknown>
+        sceneFilePath: string; assetFilePaths: string[]
+        frameStart: number; frameEnd: number; chunkSize: number
+        renderer: string; blenderVersion: string; gpuEnabled: boolean
+      }) => Promise<{ jobNumber: string; id: string }>
     }
     projects: {
       list: (token: string) => Promise<{ id: string; name: string; isActive: boolean }[]>
@@ -32,6 +38,9 @@ interface Window {
         projectId: string
       }) => Promise<{ jobNumber: string; id: string }>
       onUploadProgress: (cb: (pct: number) => void) => void
+    }
+    assets: {
+      onUploadProgress: (cb: (data: { index: number; total: number; filename: string; pct: number; phase: string }) => void) => void
     }
     submission: {
       load:         () => Promise<{ filePath: string; content: string } | null>

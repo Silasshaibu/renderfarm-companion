@@ -51,6 +51,20 @@ interface Project { id: string; name: string; isActive: boolean }
 interface EnvRow   { id: string; key: string; value: string }
 interface Props    { auth: AuthState; setStatus: (s: string) => void }
 
+// Parse a frame-range expression (e.g. "1-10", "1,3,5-10") into its min/max bounds.
+// Used to populate manifest.frame_start / frame_end for the render worker.
+function parseFrameBounds(expr: string): { start: number; end: number } {
+  const nums: number[] = []
+  for (const part of expr.split(',')) {
+    const m = part.trim().match(/^(\d+)(?:-(\d+))?/)
+    if (!m) continue
+    nums.push(parseInt(m[1], 10))
+    if (m[2]) nums.push(parseInt(m[2], 10))
+  }
+  if (!nums.length) return { start: 1, end: 1 }
+  return { start: Math.min(...nums), end: Math.max(...nums) }
+}
+
 // ── Help icon — self-contained popover ───────────────────────────────────────
 function HelpIcon({ title, body }: { title: string; body: string | string[] }) {
   const [open, setOpen] = useState(false)
@@ -235,10 +249,10 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
   // Derived
   const softwarePkg   = SOFTWARE_PACKAGES.find((p) => p.id === softwareName)
   const softwareLabel = softwareName && softwareVersion ? `${softwareName}:${softwareVersion}` : ''
-  // GCP also requires a .blend file to have been selected
+  // Every provider requires a scene file to have been selected — without one,
+  // the job is guaranteed to fail once it reaches the render worker.
   const canSubmit     = Boolean(
-    jobTitle.trim() && projectId &&
-    (provider !== 'gcp' || uploadPaths.length > 0)
+    jobTitle.trim() && projectId && uploadPaths.length > 0
   )
 
   // Build preview payload
@@ -294,13 +308,39 @@ export default function SubmissionKitPage({ auth, setStatus }: Props) {
         setSaved(true)
         setStatus(`Job ${job.jobNumber} submitted → GCP`)
       } else {
-        const job = await window.rfApi.jobs.create(auth.token, {
-          provider,
-          title: jobTitle.trim(), software: softwareLabel, cores: 4,
-          gpuCount: gpuEnabled ? 1 : 0, projectId,
-          frames, chunkSize, tiles: tilesOn ? tilesVal : null,
-          scoutFrames: scoutOn ? scoutFrames : null,
-          outputPath: outputFolder, taskTemplate,
+        // Non-GCP ("Renderfarm" / local-worker) jobs are picked up by the Python
+        // render worker, which requires a real scene file + manifest — it will
+        // not accept a metadata-only job. Hash + upload the scene file (and any
+        // extra assets) through the preflight → token → PUT → confirm flow,
+        // then build a real manifest before creating the job.
+        if (!uploadPaths[0]) {
+          throw new Error('No scene file selected. Go to the FILES tab and add your scene file first.')
+        }
+
+        window.rfApi.assets.onUploadProgress(({ index, total, filename, pct, phase }) => {
+          if (phase === 'preflight') setStatus('Checking assets against server…')
+          else if (phase === 'uploading') setStatus(`Uploading ${filename} (${index + 1}/${total})… ${pct}%`)
+          else if (phase === 'done') setStatus('Assets uploaded — creating job…')
+        })
+
+        const { start: frameStart, end: frameEnd } = parseFrameBounds(frames)
+
+        const job = await window.rfApi.jobs.submitWithScene({
+          token: auth.token,
+          data: {
+            provider,
+            title: jobTitle.trim(), software: softwareLabel, cores: 4,
+            gpuCount: gpuEnabled ? 1 : 0, projectId,
+            frames, chunkSize, tiles: tilesOn ? tilesVal : null,
+            scoutFrames: scoutOn ? scoutFrames : null,
+            outputPath: outputFolder, taskTemplate,
+          },
+          sceneFilePath:  uploadPaths[0],
+          assetFilePaths: uploadPaths.slice(1),
+          frameStart, frameEnd, chunkSize: parseInt(chunkSize) || 1,
+          renderer:       softwareName || 'blender',
+          blenderVersion: softwareVersion || '',
+          gpuEnabled,
         })
         setSubmitted(job.jobNumber)
         setSaved(true)
@@ -556,17 +596,26 @@ else:
               </svg>
             </button>
             <button type="button" className="sk-tb-btn sk-tb-btn--primary"
-              title={provider === 'gcp' ? 'Select .blend file' : 'Add files'}
+              title={provider === 'gcp' ? 'Select .blend file' : uploadPaths.length === 0 ? 'Select scene file' : 'Add asset file'}
               onClick={async () => {
                 if (provider === 'gcp') {
                   const filePath = await window.rfApi.dialog.pickFile('Select .blend file', ['blend'])
                   if (!filePath) return
                   setUploadPaths([filePath])   // GCP: one scene file only
                   setStatus(`Selected: ${filePath}`)
+                } else if (uploadPaths.length === 0) {
+                  // First pick is always the primary scene file that gets uploaded
+                  // and flagged type "blend" in the manifest.
+                  const filePath = await window.rfApi.dialog.pickFile('Select scene file', ['blend', 'ma', 'mb', 'hip', 'nk', 'c4d', 'max'])
+                  if (!filePath) return
+                  setUploadPaths([filePath])
+                  setStatus(`Selected scene file: ${filePath}`)
                 } else {
-                  const fake = `/assets/scene_${Date.now()}.blend`
-                  setUploadPaths((p) => [...p, fake])
-                  setStatus(`Added: ${fake}`)
+                  // Subsequent picks are extra dependency assets (textures, caches, etc.)
+                  const filePath = await window.rfApi.dialog.pickFile('Add asset file', [])
+                  if (!filePath) return
+                  setUploadPaths((p) => [...p, filePath])
+                  setStatus(`Added: ${filePath}`)
                 }
               }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -767,7 +816,7 @@ else:
               <div className="sk-files-empty">
                 {provider === 'gcp'
                   ? 'No .blend file selected. Click the folder+ button above to pick your scene file.'
-                  : 'No assets selected for upload.'}</div>
+                  : 'No scene file selected. Click the folder+ button above to pick the scene file to render — a job cannot be submitted without one.'}</div>
             ) : (
               <div className="sk-files-list">
                 {uploadPaths.map((path, i) => (
@@ -780,6 +829,11 @@ else:
                       <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
                       <polyline points="14 2 14 8 20 8"/>
                     </svg>
+                    {provider !== 'gcp' && (
+                      <span className="sk-inline-label" style={{ marginRight: 6 }}>
+                        {i === 0 ? 'Scene:' : 'Asset:'}
+                      </span>
+                    )}
                     <span className="sk-file-path">{path}</span>
                     <button type="button" className="sk-file-del" title="Remove file"
                       onClick={(e) => {
@@ -1021,7 +1075,11 @@ else:
 
           <button type="button" className="sk-submit-btn"
             disabled={!canSubmit || submitting || projects.length === 0}
-            title={projects.length === 0 ? 'Create an active project first (Admin → Projects)' : undefined}
+            title={
+              projects.length === 0 ? 'Create an active project first (Admin → Projects)'
+              : uploadPaths.length === 0 ? 'Select a scene file in the FILES tab first'
+              : undefined
+            }
             onClick={handleSubmit}>
             {submitting ? 'SUBMITTING…' : provider === 'gcp' ? 'SUBMIT → GCP' : 'SUBMIT'}
           </button>

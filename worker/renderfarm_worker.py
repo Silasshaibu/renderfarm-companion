@@ -53,7 +53,7 @@ from pathlib import Path
 WORKER_HOSTNAME = socket.gethostname()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_BASE      = os.environ.get("RF_API_BASE", "https://renderfarm.swade-art.com/api")
+API_BASE      = os.environ.get("RF_API_BASE", "https://renderfarm-web.vercel.app/api")
 POLL_INTERVAL = 15   # seconds between polls when idle
 
 # Common Windows Blender installation paths (newest first)
@@ -380,6 +380,49 @@ def prepare_scene_v7(job, work_dir):
     return blend_file
 
 
+# ── Scout-frame expression resolver ──────────────────────────────────────────
+# Python port of lib/utils/frames.ts:resolveScoutFrames — must stay in sync with it.
+def _resolve_scout_frames(expr, all_frames):
+    """
+    Resolve a scout-frame expression against the full frame list.
+
+      "fml:N"    -- first, middle(s), last (N total)
+      "auto:N"   -- N evenly-distributed frames
+      otherwise  -- treated as an explicit frame list/range, filtered to all_frames
+
+    Returns a sorted list of frame numbers (subset of all_frames), or [] if the
+    expression is empty or all_frames is empty.
+    """
+    import re as _re
+
+    e = (expr or "").strip().lower()
+    if not e or not all_frames:
+        return []
+
+    fml_match = _re.match(r"^fml:(\d+)$", e)
+    if fml_match:
+        n = max(1, int(fml_match.group(1)))
+        if n == 1:
+            return [all_frames[0]]
+        if n == 2:
+            return sorted({all_frames[0], all_frames[-1]})
+        indices = [0] + [round(i * (len(all_frames) - 1) / (n - 1)) for i in range(1, n - 1)] + [len(all_frames) - 1]
+        return sorted({all_frames[i] for i in indices})
+
+    auto_match = _re.match(r"^auto:(\d+)$", e)
+    if auto_match:
+        n = max(1, int(auto_match.group(1)))
+        if n >= len(all_frames):
+            return list(all_frames)
+        indices = [0] if n == 1 else [round(i * (len(all_frames) - 1) / (n - 1)) for i in range(n)]
+        return sorted({all_frames[i] for i in indices})
+
+    # Explicit list/range — reuse _parse_frames, then filter to the real frame set
+    explicit, _ = _parse_frames(expr)
+    frame_set = set(all_frames)
+    return sorted(f for f in explicit if f in frame_set)
+
+
 # ── Frame-range parser ────────────────────────────────────────────────────────
 def _parse_frames(frames_str):
     """
@@ -415,7 +458,20 @@ def render_job(job, blender_path, token):
     # v7 manifest takes precedence for frame range
     manifest = job.get("manifest") or {}
     if manifest and "frame_start" in manifest and "frame_end" in manifest:
-        frames = f"{manifest['frame_start']}-{manifest['frame_end']}"
+        frame_start = int(manifest["frame_start"])
+        frame_end   = int(manifest["frame_end"])
+        frames = f"{frame_start}-{frame_end}"
+
+        # Scout frames (chunk_size/scout_frames/use_scout_frames are persisted into
+        # the manifest by POST /api/jobs for both GCP and local-worker jobs). If set,
+        # render only the resolved scout subset instead of the full contiguous range.
+        use_scouts = bool(manifest.get("use_scout_frames", False))
+        scout_expr = str(manifest.get("scout_frames", "") or "")
+        if use_scouts and scout_expr.strip():
+            full_range = list(range(frame_start, frame_end + 1))
+            scout_list = _resolve_scout_frames(scout_expr, full_range)
+            if scout_list:
+                frames = ",".join(str(f) for f in scout_list)
 
     # Detect submission mode
     assets       = manifest.get("assets", [])
@@ -427,10 +483,14 @@ def render_job(job, blender_path, token):
     requires_gpu  = instance_type == "GPU"
 
     # ── Fetch wrangler settings (best-effort) ────────────────────────────────
+    # Stored under the "max_runtime" key as a nested object:
+    #   {"enabled": bool, "max_hours": number, "action": "kill"|"retry"|"notify"}
+    # (written by PATCH /api/virtual-wrangler/max-runtime)
     ws = fetch_wrangler_settings(token)
-    max_runtime_on  = bool(ws.get("maxRuntimeOn", True))
-    max_runtime_hrs = float(ws.get("maxRuntime", 2))     # hours; default 2h
-    runtime_action  = str(ws.get("runtimeAction", "Kill"))
+    max_runtime_cfg = ws.get("max_runtime") or {}
+    max_runtime_on  = bool(max_runtime_cfg.get("enabled", True))
+    max_runtime_hrs = float(max_runtime_cfg.get("max_hours", 2))     # hours; default 2h
+    runtime_action  = str(max_runtime_cfg.get("action", "kill"))
 
     # Hard cap: 12 hours; minimum: 10 minutes
     max_runtime_secs = max(600, min(43200, int(max_runtime_hrs * 3600)))
