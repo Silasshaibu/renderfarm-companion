@@ -49,6 +49,54 @@ const MAYA_VERSIONS: PluginVersion[] = [
   },
 ]
 
+const HOUDINI_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.1.0 — Houdini (Python3, all platforms)',
+    version:     '1.1.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_houdini_v1.1.0.zip',
+  },
+]
+
+const CINEMA4D_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.0.0 — Cinema 4D R21–2024 (Mac and Windows)',
+    version:     '1.0.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_c4d_v1.0.0.zip',
+  },
+]
+
+const MAX_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.0.0 — 3ds Max (Windows)',
+    version:     '1.0.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_3dsmax_v1.0.0.zip',
+  },
+]
+
+const NUKE_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.0.0 — Nuke 13.1–14.1 and above',
+    version:     '1.0.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_nuke_v1.0.0.zip',
+  },
+]
+
+const KATANA_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.0.0 — Katana 4.5v1 and above',
+    version:     '1.0.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_katana_v1.0.0.zip',
+  },
+]
+
+const UNREAL_VERSIONS: PluginVersion[] = [
+  {
+    label:       'v1.0.0 — Unreal 5.2 and above (Movie Render Queue)',
+    version:     '1.0.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_unreal_v1.0.0.zip',
+  },
+]
+
 const PLUGINS: Plugin[] = [
   {
     id: 'maya', name: 'Renderfarm for Maya',
@@ -59,7 +107,8 @@ const PLUGINS: Plugin[] = [
   {
     id: 'cinema4d', name: 'Renderfarm for Cinema 4D',
     description: 'A plugin to submit render jobs from Cinema 4D. Tested on versions R21 to R24, Mac and Windows.',
-    version: '0.0.0', icon: 'C', iconColor: '#06b6d4', available: false,
+    version: '1.0.0', icon: 'C', iconColor: '#06b6d4', available: true,
+    versions: CINEMA4D_VERSIONS,
   },
   {
     id: 'blender', name: 'Renderfarm for Blender',
@@ -71,27 +120,32 @@ const PLUGINS: Plugin[] = [
   {
     id: 'nuke', name: 'Renderfarm for Nuke',
     description: 'Nuke plugin submitter for the render farm service. Compatible with Nuke 13 and above.',
-    version: '0.0.0', icon: 'N', iconColor: '#eab308', available: false,
+    version: '1.0.0', icon: 'N', iconColor: '#eab308', available: true,
+    versions: NUKE_VERSIONS,
   },
   {
     id: 'unreal', name: 'Renderfarm for Unreal',
     description: 'Unreal Engine plugin to manage MovieRenderPipeline submissions. Supports Unreal 5.2 and above.',
-    version: '0.0.0', icon: 'U', iconColor: '#8b5cf6', available: false,
+    version: '1.0.0', icon: 'U', iconColor: '#8b5cf6', available: true,
+    versions: UNREAL_VERSIONS,
   },
   {
     id: '3dsmax', name: 'Renderfarm for 3ds Max',
     description: '3ds Max plugin submitter for the render farm cloud rendering service.',
-    version: '0.0.0', icon: '3', iconColor: '#3b82f6', available: false,
+    version: '1.0.0', icon: '3', iconColor: '#3b82f6', available: true,
+    versions: MAX_VERSIONS,
   },
   {
     id: 'houdini', name: 'Renderfarm for Houdini',
     description: 'A ROP to submit work from Houdini to the render cloud. Compatible with Python3 versions of Houdini for all platforms.',
-    version: '0.0.0', icon: 'H', iconColor: '#f97316', available: false,
+    version: '1.1.0', icon: 'H', iconColor: '#f97316', available: true,
+    versions: HOUDINI_VERSIONS,
   },
   {
     id: 'katana', name: 'Renderfarm for Katana',
     description: 'Katana plugin node to manage submissions to the render farm. Supports Katana from 5.0v1 and above.',
-    version: '0.0.0', icon: 'K', iconColor: '#22d3ee', available: false,
+    version: '1.0.0', icon: 'K', iconColor: '#22d3ee', available: true,
+    versions: KATANA_VERSIONS,
   },
 ]
 

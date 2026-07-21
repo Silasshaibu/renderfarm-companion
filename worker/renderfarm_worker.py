@@ -301,6 +301,160 @@ def find_maya():
     return shutil.which("Render")
 
 
+# ── Houdini detection ─────────────────────────────────────────────────────────
+# hython.exe is Houdini's bundled Python interpreter with `hou` importable —
+# used (via a driver script, see render_drivers/houdini_render_rop.py) rather
+# than a dedicated command-line render binary, since Houdini has none.
+HOUDINI_SEARCH_PATHS = [
+    r"C:\Program Files\Side Effects Software\Houdini 20.5.410\bin\hython.exe",
+    r"C:\Program Files\Side Effects Software\Houdini 20.5.322\bin\hython.exe",
+    r"C:\Program Files\Side Effects Software\Houdini 20.0.751\bin\hython.exe",
+    r"C:\Program Files\Side Effects Software\Houdini 19.5.805\bin\hython.exe",
+]
+
+
+def find_hython():
+    if "HYTHON_PATH" in os.environ:
+        return os.environ["HYTHON_PATH"]
+    for path in HOUDINI_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    # Fall back to scanning any installed Houdini version's bin folder.
+    base = r"C:\Program Files\Side Effects Software"
+    if os.path.isdir(base):
+        for entry in sorted(os.listdir(base), reverse=True):
+            candidate = os.path.join(base, entry, "bin", "hython.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    import shutil
+    return shutil.which("hython")
+
+
+HOUDINI_RENDER_DRIVER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "render_drivers", "houdini_render_rop.py"
+)
+
+
+# ── Cinema 4D detection ───────────────────────────────────────────────────────
+# Commandline.exe is Maxon's dedicated headless render binary (never flashes a
+# GUI/console, unlike passing -nogui to the main Cinema 4D.exe).
+C4D_SEARCH_PATHS = [
+    r"C:\Program Files\Maxon Cinema 4D 2025\Commandline.exe",
+    r"C:\Program Files\Maxon Cinema 4D 2024\Commandline.exe",
+    r"C:\Program Files\Maxon Cinema 4D 2023\Commandline.exe",
+    r"C:\Program Files\MAXON\Cinema 4D R26\Commandline.exe",
+]
+
+
+def find_c4d():
+    if "C4D_COMMANDLINE_PATH" in os.environ:
+        return os.environ["C4D_COMMANDLINE_PATH"]
+    for path in C4D_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    import shutil
+    return shutil.which("Commandline")
+
+
+# ── 3ds Max detection ─────────────────────────────────────────────────────────
+MAX_SEARCH_PATHS = [
+    r"C:\Program Files\Autodesk\3ds Max 2026\3dsmaxcmd.exe",
+    r"C:\Program Files\Autodesk\3ds Max 2025\3dsmaxcmd.exe",
+    r"C:\Program Files\Autodesk\3ds Max 2024\3dsmaxcmd.exe",
+    r"C:\Program Files\Autodesk\3ds Max 2023\3dsmaxcmd.exe",
+]
+
+
+def find_3dsmax():
+    if "MAX_CMD_PATH" in os.environ:
+        return os.environ["MAX_CMD_PATH"]
+    for path in MAX_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    import shutil
+    return shutil.which("3dsmaxcmd")
+
+
+# ── Nuke detection ────────────────────────────────────────────────────────────
+NUKE_SEARCH_PATHS = [
+    r"C:\Program Files\Nuke15.1v4\Nuke15.1.exe",
+    r"C:\Program Files\Nuke14.1v5\Nuke14.1.exe",
+    r"C:\Program Files\Nuke14.0v8\Nuke14.0.exe",
+    r"C:\Program Files\Nuke13.2v9\Nuke13.2.exe",
+]
+
+
+def find_nuke():
+    if "NUKE_PATH" in os.environ:
+        return os.environ["NUKE_PATH"]
+    for path in NUKE_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    # Fall back to scanning Program Files for any NukeX.Y install folder.
+    base = r"C:\Program Files"
+    if os.path.isdir(base):
+        for entry in sorted(os.listdir(base), reverse=True):
+            if not entry.lower().startswith("nuke"):
+                continue
+            folder = os.path.join(base, entry)
+            for fname in os.listdir(folder) if os.path.isdir(folder) else []:
+                if fname.lower().startswith("nuke") and fname.lower().endswith(".exe"):
+                    return os.path.join(folder, fname)
+    import shutil
+    return shutil.which("Nuke")
+
+
+# ── Katana detection ──────────────────────────────────────────────────────────
+# NOTE: Katana's command line does not expose an output-directory override —
+# output location is dictated by the Render/RenderOutputDefine node's own
+# saved "outputName" parameter inside the .katana file. See render_job()'s
+# Katana branch for how frame collection handles this (scans the whole work
+# directory for newly-created images rather than a fixed output folder).
+KATANA_SEARCH_PATHS = [
+    r"C:\Program Files\Katana6.0v1\bin\katanaBin.exe",
+    r"C:\Program Files\Katana5.0v1\bin\katanaBin.exe",
+    r"C:\Program Files\Katana4.5v1\bin\katanaBin.exe",
+]
+
+
+def find_katana():
+    if "KATANA_PATH" in os.environ:
+        return os.environ["KATANA_PATH"]
+    for path in KATANA_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    import shutil
+    return shutil.which("katanaBin")
+
+
+# ── Unreal Engine detection ───────────────────────────────────────────────────
+# Unreal jobs are detected by manifest["software"] == "unreal" (see
+# render_unreal_job()), not by scene extension — Unreal has no single portable
+# scene file, it renders from a whole project zip instead.
+UNREAL_SEARCH_PATHS = [
+    r"C:\Program Files\Epic Games\UE_5.5\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+    r"C:\Program Files\Epic Games\UE_5.4\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+    r"C:\Program Files\Epic Games\UE_5.3\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+    r"C:\Program Files\Epic Games\UE_5.2\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
+]
+
+
+def find_unreal():
+    if "UNREAL_EDITOR_CMD_PATH" in os.environ:
+        return os.environ["UNREAL_EDITOR_CMD_PATH"]
+    for path in UNREAL_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    base = r"C:\Program Files\Epic Games"
+    if os.path.isdir(base):
+        for entry in sorted(os.listdir(base), reverse=True):
+            candidate = os.path.join(base, entry, "Engine", "Binaries", "Win64", "UnrealEditor-Cmd.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    import shutil
+    return shutil.which("UnrealEditor-Cmd")
+
+
 # ── Scene preparation: v6 (zip) ───────────────────────────────────────────────
 def prepare_scene_v6(job, work_dir):
     """
@@ -348,7 +502,7 @@ def prepare_scene_v6(job, work_dir):
     return blend_file
 
 
-SCENE_FILE_GLOBS = ("*.blend", "*.ma", "*.mb", "*.hip", "*.hipnc", "*.c4d", "*.max")
+SCENE_FILE_GLOBS = ("*.blend", "*.ma", "*.mb", "*.hip", "*.hipnc", "*.c4d", "*.max", "*.nk", "*.katana")
 
 
 def _strip_drive(path):
@@ -505,16 +659,150 @@ def _parse_frames(frames_str):
     return [int(clean)], True
 
 
+# ── Job rendering: Unreal (dedicated path, see the big comment in render_job) ─
+def render_unreal_job(job, job_id, job_num, manifest, unreal_path, token):
+    if not unreal_path:
+        job_update(job_id, token,
+                    status="failed",
+                    worker_host=WORKER_HOSTNAME,
+                    status_description=f"No Unreal Engine installation found on "
+                                        f"'{WORKER_HOSTNAME}'. Install UnrealEditor-Cmd.exe "
+                                        f"or set UNREAL_EDITOR_CMD_PATH.")
+        return
+
+    zip_url    = manifest.get("project_zip_url", "")
+    map_name   = str(manifest.get("map_name", "") or "")
+    level_seq  = str(manifest.get("level_sequence", "") or "")
+    mrq_config = str(manifest.get("moviepipeline_config", "") or "")
+
+    if not zip_url or not map_name or not level_seq or not mrq_config:
+        job_update(job_id, token,
+                    status="failed",
+                    worker_host=WORKER_HOSTNAME,
+                    status_description="Unreal job manifest is missing project_zip_url/"
+                                        "map_name/level_sequence/moviepipeline_config.")
+        return
+
+    ws = fetch_wrangler_settings(token)
+    max_runtime_cfg = ws.get("max_runtime") or {}
+    max_runtime_on  = bool(max_runtime_cfg.get("enabled", True))
+    max_runtime_hrs = float(max_runtime_cfg.get("max_hours", 2))
+    effective_timeout = max(600, min(43200, int(max_runtime_hrs * 3600))) if max_runtime_on else 7200
+
+    print(f"\n{'='*60}")
+    print(f"  Job  : {job_num}  (Unreal Engine)")
+    print(f"  Title: {job.get('title', '?')}")
+    print(f"  Map: {map_name}  Sequence: {level_seq}")
+    print(f"  MRQ Config: {mrq_config}")
+    print(f"{'='*60}")
+
+    job_update(job_id, token,
+               status="running",
+               worker_host=WORKER_HOSTNAME,
+               status_description=f"Rendering on {WORKER_HOSTNAME}")
+
+    with tempfile.TemporaryDirectory(prefix="rf_unreal_") as work_dir:
+        zip_path = os.path.join(work_dir, "project.zip")
+        print("  [1/3] Downloading project zip…")
+        download_file(zip_url, zip_path, "project.zip")
+
+        print("  [2/3] Extracting project…")
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(work_dir)
+        os.remove(zip_path)
+
+        uproject_files = list(Path(work_dir).glob("**/*.uproject"))
+        if not uproject_files:
+            raise RuntimeError("No .uproject file found after extracting the project zip")
+        uproject_path = str(uproject_files[0])
+
+        render_start_time = time.time()
+        cmd = [
+            unreal_path,
+            uproject_path,
+            map_name,
+            "-game",
+            f"-LevelSequence={level_seq}",
+            f"-MoviePipelineConfig={mrq_config}",
+            "-windowed", "-resx=1920", "-resy=1080",
+            "-log", "-notexturestreaming",
+            "-Unattended", "-renderoffscreen",
+        ]
+
+        print("  [2/3] Rendering with Movie Render Queue…")
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=effective_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            hrs = effective_timeout / 3600
+            msg = f"Unreal exceeded the {hrs:.1f}h max runtime — job killed."
+            print(f"\n  ⚠  {msg}")
+            raise RuntimeError(msg) from exc
+
+        log_lines = (proc.stdout or "").strip().splitlines()
+        for line in log_lines[-20:]:
+            print(f"    {line}")
+        if proc.returncode != 0:
+            raise RuntimeError(f"UnrealEditor-Cmd exited with code {proc.returncode}")
+
+        post_logs(job_num, 0, log_lines, token, level="info")
+
+        # Output location isn't known in advance — MRQ presets bake in their own
+        # output directory (commonly Saved/MovieRenders/ but not guaranteed), so
+        # scan the whole extracted project for media created during this render.
+        print("  [3/3] Collecting output…")
+        media_exts = (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".mp4", ".mov", ".avi")
+        output_files = sorted(
+            f for f in Path(work_dir).rglob("*")
+            if f.is_file() and f.suffix.lower() in media_exts
+            and f.stat().st_mtime >= render_start_time
+        )
+
+        if not output_files:
+            raise RuntimeError(
+                "Unreal render finished but produced no discoverable output media — "
+                "check the MoviePipelineConfig preset's output settings.")
+
+        output_urls = []
+        for i, f in enumerate(output_files, 1):
+            url = upload_frame(str(f), job_num, token)
+            output_urls.append(url)
+            upsert_task(job_num, i - 1, token, status="done", frame_number=i,
+                        output_url=url, worker_host=WORKER_HOSTNAME)
+            print(f"        [{i}/{len(output_files)}] {f.name}")
+
+        job_update(job_id, token,
+                   status="success",
+                   outputs=output_urls,
+                   status_description=f"Completed on {WORKER_HOSTNAME} — "
+                                      f"{len(output_urls)} file(s) rendered.")
+        print(f"\n  ✓ Job {job_num} complete — {len(output_urls)} file(s) uploaded")
+
+
 # ── Job rendering ─────────────────────────────────────────────────────────────
-def render_job(job, blender_path, maya_path, token):
+def render_job(job, engines, token):
     job_id  = job["id"]
     # Accept both camelCase (API) and snake_case (raw DB)
     job_num   = job.get("jobNumber") or job.get("job_number", "?")
     blend_url = job.get("blenderFile") or job.get("blender_file", "")
     frames    = job.get("frames", "1-1")
 
-    # v7 manifest takes precedence for frame range
+    # Unreal jobs use a completely different manifest shape (a whole project
+    # zip + in-project asset paths, no assets[] array, no per-call frame range —
+    # MRQ presets bake in their own frame range/output settings) and completely
+    # different render invocation, so they're dispatched to a dedicated function
+    # before any of the assets[]-array-based v6/v7 logic below runs.
     manifest = job.get("manifest") or {}
+    if str(manifest.get("software", "")).lower() == "unreal":
+        render_unreal_job(job, job_id, job_num, manifest, engines.get("unreal"), token)
+        return
+
+    # v7 manifest takes precedence for frame range
     if manifest and "frame_start" in manifest and "frame_end" in manifest:
         frame_start = int(manifest["frame_start"])
         frame_end   = int(manifest["frame_end"])
@@ -619,20 +907,28 @@ def render_job(job, blender_path, maya_path, token):
 
         # ── Engine detection ───────────────────────────────────────────
         scene_ext = os.path.splitext(blend_file)[1].lower()
-        is_maya   = scene_ext in (".ma", ".mb")
+
+        # Katana's CLI has no output-directory override (the Render node's own
+        # saved "outputName" parameter decides where images land), so frame
+        # collection for it scans the whole work directory for files created
+        # during the render rather than a single fixed output_dir. Recording
+        # the time just before rendering starts lets us tell "new" from
+        # "pre-existing" (e.g. reference renders bundled with the project).
+        render_start_time = time.time()
 
         # ── Render ────────────────────────────────────────────────────
         output_dir = os.path.join(work_dir, "renders")
         os.makedirs(output_dir, exist_ok=True)
 
-        if is_maya:
+        if scene_ext in (".ma", ".mb"):
+            maya_path = engines.get("maya")
             if not maya_path:
                 raise RuntimeError(
                     "Job is a Maya scene (.ma/.mb) but no Maya installation was found "
                     "on this worker. Install Maya or set MAYA_RENDER_PATH.")
-            renderer_id  = str(manifest.get("renderer", "arnold")).lower()
+            renderer_id   = str(manifest.get("renderer", "arnold")).lower()
             renderer_flag = MAYA_RENDERER_FLAGS.get(renderer_id, renderer_id)
-            engine_name  = "Maya"
+            engine_name   = "Maya"
 
             def _build_cmd(frame_start, frame_end):
                 return [
@@ -650,7 +946,122 @@ def render_job(job, blender_path, maya_path, token):
                     "-proj", os.path.dirname(blend_file),
                     blend_file,
                 ]
+
+        elif scene_ext in (".hip", ".hipnc"):
+            hython_path = engines.get("hython")
+            if not hython_path:
+                raise RuntimeError(
+                    "Job is a Houdini scene (.hip/.hipnc) but no Houdini installation "
+                    "was found on this worker. Install Houdini or set HYTHON_PATH.")
+            rop_path = str(manifest.get("rop_path", "") or "")
+            if not rop_path:
+                raise RuntimeError(
+                    "Houdini job has no rop_path in its manifest — the addon should "
+                    "have required a ROP node selection before submission.")
+            engine_name = "Houdini"
+
+            def _build_cmd(frame_start, frame_end):
+                return [
+                    hython_path,
+                    HOUDINI_RENDER_DRIVER,
+                    blend_file,
+                    rop_path,
+                    str(frame_start),
+                    str(frame_end),
+                ]
+
+        elif scene_ext == ".c4d":
+            c4d_path = engines.get("c4d")
+            if not c4d_path:
+                raise RuntimeError(
+                    "Job is a Cinema 4D scene (.c4d) but no Cinema 4D installation "
+                    "was found on this worker. Install Cinema 4D or set C4D_COMMANDLINE_PATH.")
+            engine_name = "Cinema 4D"
+            # NOTE: Cinema 4D's command line cannot override which render engine
+            # is active (confirmed via Maxon's own docs) — whichever renderer the
+            # artist had active when they saved the scene is what actually runs,
+            # regardless of the "renderer" value picked in the addon's UI.
+            image_base = os.path.join(output_dir, "frame")
+
+            def _build_cmd(frame_start, frame_end):
+                return [
+                    c4d_path,
+                    "-nogui",
+                    "-render", blend_file,
+                    "-frame", str(frame_start), str(frame_end), "1",
+                    "-oimage", image_base,
+                    "-oformat", "TIFF",
+                ]
+
+        elif scene_ext == ".max":
+            max_path = engines.get("3dsmax")
+            if not max_path:
+                raise RuntimeError(
+                    "Job is a 3ds Max scene (.max) but no 3ds Max installation was "
+                    "found on this worker. Install 3ds Max or set MAX_CMD_PATH.")
+            engine_name = "3ds Max"
+            # NOTE: same renderer-override limitation as Cinema 4D above — no
+            # 3dsmaxcmd flag exists to force Arnold/V-Ray/Corona/Scanline; the
+            # scene's own saved renderer assignment is what actually runs.
+            output_name = os.path.join(output_dir, "frame.png")
+
+            def _build_cmd(frame_start, frame_end):
+                return [
+                    max_path,
+                    "-rfw:0",
+                    f"-start:{frame_start}",
+                    f"-end:{frame_end}",
+                    f"-outputName:{output_name}",
+                    blend_file,
+                ]
+
+        elif scene_ext == ".nk":
+            nuke_path = engines.get("nuke")
+            if not nuke_path:
+                raise RuntimeError(
+                    "Job is a Nuke script (.nk) but no Nuke installation was found "
+                    "on this worker. Install Nuke or set NUKE_PATH.")
+            write_node = str(manifest.get("write_node", "") or "")
+            if not write_node:
+                raise RuntimeError(
+                    "Nuke job has no write_node in its manifest — the addon should "
+                    "have required a Write node selection before submission.")
+            engine_name = "Nuke"
+
+            def _build_cmd(frame_start, frame_end):
+                # -F (frame range) must precede the script path; -x/-X order
+                # relative to each other doesn't matter, per Foundry's docs.
+                return [
+                    nuke_path,
+                    "-F", f"{frame_start}-{frame_end}",
+                    "-x", "-X", write_node,
+                    blend_file,
+                ]
+
+        elif scene_ext == ".katana":
+            katana_path = engines.get("katana")
+            if not katana_path:
+                raise RuntimeError(
+                    "Job is a Katana project (.katana) but no Katana installation "
+                    "was found on this worker. Install Katana or set KATANA_PATH.")
+            render_node = str(manifest.get("render_node", "") or "")
+            if not render_node:
+                raise RuntimeError(
+                    "Katana job has no render_node in its manifest — the addon "
+                    "should have required a Render node selection before submission.")
+            engine_name = "Katana"
+
+            def _build_cmd(frame_start, frame_end):
+                return [
+                    katana_path,
+                    "--batch",
+                    f"--katana-file={blend_file}",
+                    f"--render-node={render_node}",
+                    "-t", f"{frame_start}-{frame_end}",
+                ]
+
         else:
+            blender_path = engines.get("blender")
             if not blender_path:
                 raise RuntimeError(
                     "Job is a Blender scene (.blend) but no Blender installation was "
@@ -748,13 +1159,28 @@ def render_job(job, blender_path, maya_path, token):
             post_logs(job_num, 0, error_lines, token, level="error")
 
         # ── Upload frames ─────────────────────────────────────────────
-        # Collect rendered files in frame-number order (Blender names them frame_XXXX.*;
-        # Maya's own naming convention varies by scene settings, so we just match by
-        # extension rather than an exact filename pattern).
-        frame_files = sorted(
-            f for f in Path(output_dir).iterdir()
-            if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
-        )
+        IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff")
+
+        if engine_name == "Katana":
+            # Katana's CLI has no output-directory override — images land
+            # wherever the Render node's own "outputName" parameter points,
+            # which could be anywhere under work_dir. Fall back to scanning
+            # the whole work directory for image files created during this
+            # render (mtime after render_start_time), rather than a fixed dir.
+            frame_files = sorted(
+                f for f in Path(work_dir).rglob("*")
+                if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+                and f.stat().st_mtime >= render_start_time
+            )
+        else:
+            # Collect rendered files in frame-number order (Blender names them
+            # frame_XXXX.*; Maya/Houdini/C4D/3ds Max/Nuke naming conventions
+            # vary by scene settings, so we just match by extension rather
+            # than an exact filename pattern).
+            frame_files = sorted(
+                f for f in Path(output_dir).iterdir()
+                if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+            )
 
         if not frame_files:
             raise RuntimeError(f"{engine_name} produced no output frames")
@@ -953,17 +1379,31 @@ def main():
         print("  2. Set the RF_TOKEN environment variable manually.")
         sys.exit(1)
 
-    blender = find_blender()
-    maya    = find_maya()
-    if not blender and not maya:
-        print("\nERROR: Neither Blender nor Maya was found on this machine.")
-        print("  Install one of them, or set BLENDER_PATH / MAYA_RENDER_PATH.")
+    engines = {
+        "blender": find_blender(),
+        "maya":    find_maya(),
+        "hython":  find_hython(),
+        "c4d":     find_c4d(),
+        "3dsmax":  find_3dsmax(),
+        "nuke":    find_nuke(),
+        "katana":  find_katana(),
+        "unreal":  find_unreal(),
+    }
+    if not any(engines.values()):
+        print("\nERROR: No supported DCC application was found on this machine.")
+        print("  Install at least one of: Blender, Maya, Houdini, Cinema 4D,")
+        print("  3ds Max, Nuke, Katana, Unreal — or set the matching *_PATH env var.")
         sys.exit(1)
 
     print(f"\n  API:     {API_BASE}")
     print(f"  User:    {email}")
-    print(f"  Blender: {blender or '(not found — Blender jobs will fail)'}")
-    print(f"  Maya:    {maya or '(not found — Maya jobs will fail)'}")
+    for label, key in (
+        ("Blender",   "blender"), ("Maya",   "maya"),   ("Houdini", "hython"),
+        ("Cinema 4D", "c4d"),     ("3ds Max", "3dsmax"), ("Nuke",    "nuke"),
+        ("Katana",    "katana"),  ("Unreal",  "unreal"),
+    ):
+        path = engines[key]
+        print(f"  {label + ':':<11} {path or '(not found — ' + label + ' jobs will fail)'}")
     print(f"  Polling every {POLL_INTERVAL}s for pending/queued jobs…")
     print()
 
@@ -998,7 +1438,7 @@ def main():
                 # Oldest job first (lowest id)
                 job = sorted(ready, key=lambda j: int(j["id"]))[0]
                 try:
-                    render_job(job, blender, maya, token)
+                    render_job(job, engines, token)
                 except Exception as e:
                     jnum = job.get("jobNumber") or job.get("job_number", job["id"])
                     print(f"\n  ERROR rendering {jnum}: {e}")

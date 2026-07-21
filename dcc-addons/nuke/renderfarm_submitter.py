@@ -1,25 +1,21 @@
 """
-Renderfarm Houdini Submitter v1.1.0
-Submit Houdini render jobs to Renderfarm directly from Houdini.
+Renderfarm Nuke Submitter v1.0.0
+Submit Nuke render jobs to Renderfarm directly from Nuke.
 
 Installation:
-  1. In Houdini: Shelves → New Tool → paste the following into the Script tab:
+  1. Copy this file anywhere on disk (e.g. next to your menu.py / .nuke folder).
+  2. In Nuke: Script Editor -> run:
        import sys; sys.path.insert(0, r"/path/to/folder")
        import renderfarm_submitter; renderfarm_submitter.show()
-  2. Click the shelf button to open the submitter.
+  3. Or wire it into a menu item via menu.py:
+       nuke.menu('Nuke').addCommand('Renderfarm/Submit...', 'renderfarm_submitter.show()')
 
-Requirements: Houdini 19.5+ (ships PySide2). Python 3.
-
-Changelog:
-  v1.1.0 - Added a "Render Node (ROP)" combo box. Houdini scenes can contain
-           many ROP (output/driver) nodes, unlike Maya's single active
-           renderer -- the artist must tell the farm which one to execute.
-           The selected ROP's node path is now sent to the API as
-           "rop_path" in the job manifest, so the render worker knows
-           exactly what to run (e.g. via hou.node(rop_path).render(...)).
+Requirements: Nuke 13+ (ships PySide2). Python 3.
 """
 
 import os
+import re
+import glob
 import json
 import hashlib
 import threading
@@ -30,12 +26,12 @@ import urllib.error
 import http.server
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Houdini imports ───────────────────────────────────────────────────────────
+# ── Nuke imports ──────────────────────────────────────────────────────────────
 try:
-    import hou
-    _IN_HOUDINI = True
+    import nuke
+    _IN_NUKE = True
 except ImportError:
-    _IN_HOUDINI = False
+    _IN_NUKE = False
 
 try:
     from PySide2 import QtWidgets, QtCore, QtGui
@@ -50,18 +46,19 @@ WEB_BASE      = "https://renderfarm-web.vercel.app"
 CALLBACK_PORT = 8989
 _TOKEN_FILE   = os.path.join(os.path.expanduser("~"), ".rf_token")
 
-HOUDINI_VERSIONS = [
-    ("houdini-20.5", "Houdini 20.5"),
-    ("houdini-20.0", "Houdini 20.0"),
-    ("houdini-19.5", "Houdini 19.5"),
+NUKE_VERSIONS = [
+    ("nuke-14.0", "Nuke 14.0"),
+    ("nuke-13.2", "Nuke 13.2"),
+    ("nuke-13.1", "Nuke 13.1"),
 ]
 
-RENDERERS = [
-    ("karma",   "Karma (USD)"),
-    ("mantra",  "Mantra"),
-    ("redshift","Redshift"),
-    ("arnold",  "Arnold"),
-]
+# Nuke is a compositor, not a 3D renderer — there's no Arnold/V-Ray-style
+# "renderer" choice the way there is in Maya/Houdini. We still send a fixed
+# "renderer" value in the job payload/manifest so the shape matches the
+# other DCC addons (the worker's prepare_scene_v7() reads this field
+# generically). The artist-facing choice that actually matters for Nuke is
+# *which Write node to render*, exposed below instead of a renderer combo.
+NUKE_RENDERER = "nuke"
 
 _FALLBACK_MACHINE_TYPES = {
     "GPU": [("t4-1", "T4 16GB · 4 vCPU · 15 GB")],
@@ -147,13 +144,13 @@ class _AuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         email  = params.get("email",  [None])[0]
         if parsed.path == "/callback" and token and email:
             html = (
-                b"<!doctype html><html><head><meta charset='utf-8'>"
+                b"<!doctype html><html><head><meta charset='utf-8'><title>Renderfarm</title>"
                 b"<style>body{margin:0;min-height:100vh;display:flex;align-items:center;"
                 b"justify-content:center;background:#0d0d1a;font-family:system-ui;color:#fff}"
                 b".card{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:16px;"
                 b"padding:48px;text-align:center}</style></head>"
-                b"<body><div class='card'><h2 style='color:#22d3ee'>&#10003; Houdini Connected</h2>"
-                b"<p>You can close this tab and return to Houdini.</p></div></body></html>"
+                b"<body><div class='card'><h2 style='color:#22d3ee'>&#10003; Nuke Connected</h2>"
+                b"<p>You can close this tab and return to Nuke.</p></div></body></html>"
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -170,6 +167,7 @@ class _AuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def _start_browser_login(on_success):
+    """Opens system browser to renderfarm login; on_success(token, email) called on receipt."""
     result = {}
 
     def handler_factory(*args, **kwargs):
@@ -187,104 +185,98 @@ def _start_browser_login(on_success):
     threading.Thread(target=_serve, daemon=True).start()
 
 # ── Dependency scanner ────────────────────────────────────────────────────────
-def _scan_dependencies():
-    """Use hou.fileReferences() to find all external files referenced in the .hip."""
-    if not _IN_HOUDINI:
+_SEQ_PRINTF_RE = re.compile(r"%0?\d*d")   # e.g. %04d, %d
+_SEQ_HASH_RE   = re.compile(r"#+")        # e.g. ####
+
+def _expand_sequence(raw_path):
+    """A Nuke 'file' knob often holds a sequence pattern (printf %04d or
+    #### padding) rather than a single file. Expand it to the files that
+    currently exist on disk matching that pattern. Falls back to the raw
+    path as a single entry if there's no padding token, or if nothing on
+    disk matches (e.g. an unrendered/upstream sequence, or a path glob
+    can't reach such as some UNC shares)."""
+    if not raw_path:
         return []
+    if not (_SEQ_PRINTF_RE.search(raw_path) or _SEQ_HASH_RE.search(raw_path)):
+        return [raw_path]
+    glob_pattern = _SEQ_PRINTF_RE.sub("*", raw_path)
+    glob_pattern = _SEQ_HASH_RE.sub("*", glob_pattern)
+    try:
+        matches = sorted(glob.glob(glob_pattern))
+    except Exception:
+        matches = []
+    return matches if matches else [raw_path]
+
+
+def _knob_file_value(node, knob_name="file"):
+    """Read a node's file knob, resolving Nuke TCL/env expressions where
+    possible. Frame-padding tokens (%04d / ####) are intentionally left
+    intact here — _expand_sequence() handles those."""
+    try:
+        k = node.knob(knob_name)
+        if not k:
+            return ""
+        try:
+            return k.evaluate()
+        except Exception:
+            return k.value()
+    except Exception:
+        return ""
+
+
+def _scan_dependencies():
+    """Return list of {path, type, size, exists} for all external files
+    referenced by Read and Precomp nodes (the priority, per Nuke's own
+    dependency model), plus a best-effort pass over any other node exposing
+    a generic 'file' File_Knob (LUTs via Vectorfield/OCIOFileTransform,
+    Camera lens files, gizmos with baked-in file knobs, etc.)."""
+    if not _IN_NUKE:
+        return []
+
     seen   = set()
     assets = []
 
-    def _add(path, asset_type):
-        if not path:
-            return
-        abs_path = hou.expandString(path)
-        abs_path = os.path.abspath(abs_path)
-        if abs_path in seen:
-            return
-        seen.add(abs_path)
-        assets.append({
-            "path":   abs_path,
-            "type":   asset_type,
-            "size":   os.path.getsize(abs_path) if os.path.exists(abs_path) else 0,
-            "exists": os.path.exists(abs_path),
-        })
+    def _add(raw_path, asset_type):
+        for f in _expand_sequence(raw_path):
+            abs_path = os.path.abspath(f)
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            assets.append({
+                "path":   abs_path,
+                "type":   asset_type,
+                "size":   os.path.getsize(abs_path) if os.path.exists(abs_path) else 0,
+                "exists": os.path.exists(abs_path),
+            })
 
-    # Built-in HOM: returns list of (parm, value) for all file references
-    for parm, value in hou.fileReferences():
-        if not value:
+    # Read nodes — image/geo/cache sequences (the primary source of
+    # external dependencies in a Nuke script).
+    for node in nuke.allNodes("Read"):
+        _add(_knob_file_value(node, "file"), "read")
+
+    # Precomp nodes — nested .nk scripts.
+    for node in nuke.allNodes("Precomp"):
+        _add(_knob_file_value(node, "file"), "precomp")
+
+    # Best-effort bonus pass: any other node exposing a 'file' File_Knob
+    # we haven't already covered above. This will catch most LUT/camera
+    # file references but may miss custom or differently-named knobs
+    # (e.g. font knobs on Text nodes are a Font_Knob, not a File_Knob,
+    # and are not covered here).
+    covered_classes = ("Read", "Precomp")
+    try:
+        all_nodes = nuke.allNodes(recurseGroups=True)
+    except Exception:
+        all_nodes = nuke.allNodes()
+    for node in all_nodes:
+        if node.Class() in covered_classes:
             continue
-        # Classify by parm name hints
-        p_name = parm.name().lower() if parm else ""
-        if any(k in p_name for k in ("tex", "img", "image", "map", "hdri")):
-            asset_type = "texture"
-        elif any(k in p_name for k in ("alembic", "abc", "bgeo", "geo", "vdb")):
-            asset_type = "cache"
-        elif "hip" in p_name:
-            asset_type = "reference"
-        else:
-            asset_type = "file"
-        _add(value, asset_type)
+        k = node.knob("file")
+        if k is None or k.Class() != "File_Knob":
+            continue
+        _add(_knob_file_value(node, "file"), "file")
 
     return assets
-
-# ── ROP (render node) scanner ────────────────────────────────────────────────
-def _scan_rop_nodes():
-    """
-    Find renderable ROP nodes in the currently open .hip file.
-
-    Houdini has no single "active renderer" the way Maya does -- a scene can
-    contain any number of output-driver nodes (Mantra "ifd", Karma, Arnold,
-    Redshift ROP, USD Render, OpenGL, etc.), any of which the artist might
-    want to submit. There's no way for the addon (or a headless render
-    worker) to guess which one is intended, so the artist must pick one
-    explicitly here.
-
-    /out is Houdini's conventional render-node network (it's created by
-    default and is where the Render menu/shelf tools place new ROPs), so
-    that's where we look first. ROPs aren't *required* to live under /out
-    though -- artists sometimes group them in a "ropnet" subnet, or place one
-    elsewhere in the scene -- so we also recurse one hop into any child that
-    itself contains children, to catch ROPs nested inside a subnet/ropnet
-    container under /out.
-
-    A node is treated as a renderable ROP if its node type's category is
-    "Driver" -- this is the category Houdini assigns to every output-driver
-    node type (ifd/mantra, karma, arnold, redshift_rop, usdrender, opengl,
-    wren, comp, geometry, etc.), so checking it is more robust than
-    maintaining an explicit list of renderer-specific type names.
-
-    Returns a list of (node_path, friendly_label) tuples, e.g.
-    [("/out/mantra1", "/out/mantra1  (ifd)")]. Returns [] if not running
-    inside Houdini, if /out doesn't exist, or if no ROPs were found --
-    callers should show a clear message in that case rather than silently
-    leaving the render node unset.
-    """
-    if not _IN_HOUDINI:
-        return []
-
-    out = hou.node("/out")
-    if out is None:
-        return []
-
-    rops = []
-
-    def _is_rop(node):
-        try:
-            return node.type().category().name() == "Driver"
-        except Exception:
-            return False
-
-    def _collect(container):
-        for child in container.children():
-            if _is_rop(child):
-                rops.append((child.path(), f"{child.path()}  ({child.type().name()})"))
-            elif child.children():
-                # Not a ROP itself but has children -- likely a subnet/ropnet
-                # grouping ROPs one level down. Recurse into it.
-                _collect(child)
-
-    _collect(out)
-    return rops
 
 # ── SHA-256 hashing ───────────────────────────────────────────────────────────
 def _sha256(path):
@@ -324,7 +316,7 @@ def _fetch_machine_types():
 # ── Submission worker ─────────────────────────────────────────────────────────
 class SubmitWorker(QThread):
     progress = Signal(str)
-    finished = Signal(str)
+    finished = Signal(str)   # job number
     error    = Signal(str)
 
     def __init__(self, params):
@@ -335,9 +327,13 @@ class SubmitWorker(QThread):
         p     = self.params
         token = p["token"]
         try:
-            self.progress.emit("Scanning scene dependencies…")
-            assets     = _scan_dependencies()
-            scene_file = hou.hipFile.path() if _IN_HOUDINI else ""
+            # 1. Scan + hash
+            self.progress.emit("Scanning script dependencies…")
+            assets = _scan_dependencies()
+
+            scene_file = nuke.root().name() if _IN_NUKE else ""
+            if scene_file in ("", "Root"):
+                scene_file = ""
             if scene_file and os.path.exists(scene_file):
                 assets.insert(0, {
                     "path": scene_file, "type": "scene",
@@ -348,10 +344,12 @@ class SubmitWorker(QThread):
             assets = _hash_all(assets)
             valid  = [a for a in assets if a.get("sha256")]
 
+            # 2. Preflight
             self.progress.emit("Running preflight check…")
             pre            = _post("/jobs/preflight", {"assets": [{"sha256": a["sha256"]} for a in valid]}, token)
             missing_hashes = set(pre.get("missing", []))
 
+            # 3. Create job
             self.progress.emit("Creating job…")
             resp = _post("/jobs", {
                 "title":          p["title"],
@@ -371,12 +369,13 @@ class SubmitWorker(QThread):
                     "instance_type": p["instance_type"],
                     "frame_range":   p["frames"],
                     "chunk_size":    p["chunk_size"],
-                    "rop_path":      p["rop_path"],
+                    "write_node":    p["write_node"],
                 },
             }, token)
             job_id     = resp["id"]
             job_number = resp["jobNumber"]
 
+            # 4. Upload missing assets
             to_upload = [a for a in valid if a["sha256"] in missing_hashes]
             uploaded  = 0
             sem       = threading.Semaphore(2)
@@ -401,23 +400,30 @@ class SubmitWorker(QThread):
             for t in threads: t.start()
             for t in threads: t.join()
 
+            # 5. Finalize
+            # NOTE: asset entries use "url" (matching the Houdini addon's
+            # convention) — the render worker's prepare_scene_v7() reads
+            # both "blob_url" and "url", so either works, but we keep this
+            # consistent with Houdini rather than Maya's "blob_url".
             self.progress.emit("Finalising job…")
             manifest = {
-                "scene":     os.path.basename(scene_file),
-                "software":  p["software"],
-                "renderer":  p["renderer"],
-                # Path (inside the .hip) of the ROP node the artist selected to
-                # render, e.g. "/out/mantra1". Houdini has no single "active
-                # renderer" concept like Maya, so the render worker needs this
-                # to know what to execute, e.g. hou.node(rop_path).render(...).
-                "rop_path":  p["rop_path"],
-                "assets":    [{"path": a["path"], "sha256": a["sha256"], "size_bytes": a["size"], "type": a["type"], "url": a.get("url", "")} for a in valid],
+                "scene":         os.path.basename(scene_file) if scene_file else "",
+                "software":      p["software"],
+                "renderer":      p["renderer"],
+                "instance_type": p["instance_type"],
+                "machine_type":  p["machine_type"],
+                "chunk_size":    p["chunk_size"],
+                "write_node":    p["write_node"],
+                "assets":        [{"path": a["path"], "sha256": a["sha256"], "size_bytes": a["size"], "type": a["type"], "url": a.get("url", "")} for a in valid],
             }
             _patch(f"/jobs?id={job_id}", {
-                "status": "pending", "manifest": manifest, "assets_uploaded": len(valid),
+                "status":          "pending",
+                "manifest":        manifest,
+                "assets_uploaded": len(valid),
             }, token)
 
             self.finished.emit(job_number)
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -425,10 +431,11 @@ class SubmitWorker(QThread):
 class RenderfarmSubmitter(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Renderfarm Submitter — Houdini")
+        self.setWindowTitle("Renderfarm Submitter — Nuke")
         self.setMinimumWidth(520)
         self.setStyleSheet("""
             QDialog, QWidget { background:#12121c; color:#e2e8f0; font-family:'Segoe UI',system-ui; }
+            QLabel  { color:#e2e8f0; }
             QLineEdit, QComboBox, QSpinBox {
                 background:#1e1e2e; border:1px solid #2a2a4a; border-radius:6px;
                 padding:6px 10px; color:#e2e8f0; }
@@ -442,16 +449,20 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
             QGroupBox { border:1px solid #2a2a4a; border-radius:8px; margin-top:12px; padding:8px; }
             QGroupBox::title { color:#94a3b8; padding:0 6px; }
             QCheckBox { color:#94a3b8; }
+            QLabel#status_ok    { color:#22d3ee; }
+            QLabel#status_error { color:#f87171; }
         """)
 
         self._token, self._email = _load_token()
         self._machine_types      = {}
         self._projects           = []
         self._worker             = None
+
         self._build_ui()
         if self._token:
             self._refresh_after_login()
 
+    # ── Layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(10)
@@ -460,8 +471,10 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
         hdr.setStyleSheet("font-size:18px; font-weight:700; color:#0ea5e9; padding:4px 0;")
         root.addWidget(hdr)
 
+        # Auth row
         auth_row = QtWidgets.QHBoxLayout()
         self._status_lbl = QtWidgets.QLabel("Not connected")
+        self._status_lbl.setObjectName("status_error")
         self._status_lbl.setStyleSheet("color:#f87171;")
         auth_row.addWidget(self._status_lbl, 1)
         self._connect_btn    = QtWidgets.QPushButton("Connect")
@@ -474,28 +487,28 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
         auth_row.addWidget(self._disconnect_btn)
         root.addLayout(auth_row)
 
+        # Job settings
         grp  = QtWidgets.QGroupBox("Job Settings")
         form = QtWidgets.QFormLayout(grp)
         form.setLabelAlignment(Qt.AlignRight)
 
-        self._title_edit = QtWidgets.QLineEdit("Houdini Render")
+        self._title_edit = QtWidgets.QLineEdit()
+        self._title_edit.setPlaceholderText("Nuke Render")
         form.addRow("Title:", self._title_edit)
 
         self._project_combo = QtWidgets.QComboBox()
         form.addRow("Project:", self._project_combo)
 
         self._software_combo = QtWidgets.QComboBox()
-        for val, lbl in HOUDINI_VERSIONS:
+        for val, lbl in NUKE_VERSIONS:
             self._software_combo.addItem(lbl, val)
-        form.addRow("Houdini Version:", self._software_combo)
+        form.addRow("Nuke Version:", self._software_combo)
 
-        self._renderer_combo = QtWidgets.QComboBox()
-        for val, lbl in RENDERERS:
-            self._renderer_combo.addItem(lbl, val)
-        form.addRow("Renderer:", self._renderer_combo)
-
-        self._rop_combo = QtWidgets.QComboBox()
-        form.addRow("Render Node (ROP):", self._rop_combo)
+        # No renderer combo — Nuke is a compositor, not a 3D renderer.
+        # The equivalent ambiguity (which output to render) is resolved
+        # by the Write Node combo below instead.
+        self._write_node_combo = QtWidgets.QComboBox()
+        form.addRow("Write Node:", self._write_node_combo)
 
         self._frames_edit = QtWidgets.QLineEdit("1-10")
         form.addRow("Frames:", self._frames_edit)
@@ -507,6 +520,7 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
 
         root.addWidget(grp)
 
+        # Machine settings
         mgrp  = QtWidgets.QGroupBox("Machine")
         mform = QtWidgets.QFormLayout(mgrp)
         mform.setLabelAlignment(Qt.AlignRight)
@@ -524,6 +538,7 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
 
         root.addWidget(mgrp)
 
+        # Progress + submit
         self._progress_lbl = QtWidgets.QLabel("")
         self._progress_lbl.setStyleSheet("color:#94a3b8; font-size:12px;")
         root.addWidget(self._progress_lbl)
@@ -533,32 +548,29 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
         self._submit_btn.clicked.connect(self._do_submit)
         root.addWidget(self._submit_btn)
 
-        if _IN_HOUDINI:
-            hip = hou.hipFile.path()
-            name = os.path.splitext(os.path.basename(hip))[0]
-            self._title_edit.setText(f"Houdini Render — {name}" if name else "Houdini Render")
-            rng = hou.playbar.frameRange()
-            self._frames_edit.setText(f"{int(rng[0])}-{int(rng[1])}")
+        # Populate from the current script
+        if _IN_NUKE:
+            script = nuke.root().name()
+            if script in ("", "Root"):
+                script = ""
+            name = os.path.splitext(os.path.basename(script))[0] if script else ""
+            self._title_edit.setText(f"Nuke Render — {name}" if name else "Nuke Render")
 
-        self._populate_rop_combo()
+            try:
+                first = int(nuke.root()["first_frame"].value())
+                last  = int(nuke.root()["last_frame"].value())
+                self._frames_edit.setText(f"{first}-{last}")
+            except Exception:
+                pass
 
-    def _populate_rop_combo(self):
-        """Fill the Render Node (ROP) combo from the open .hip, or show a
-        clear message instead of leaving it silently empty."""
-        self._rop_combo.clear()
-        if not _IN_HOUDINI:
-            self._rop_combo.addItem("Not running inside Houdini", None)
-            self._rop_combo.setEnabled(False)
-            return
-        rops = _scan_rop_nodes()
-        if not rops:
-            self._rop_combo.addItem("No ROP nodes found under /out — add a render node first", None)
-            self._rop_combo.setEnabled(False)
-            return
-        self._rop_combo.setEnabled(True)
-        for path, label in rops:
-            self._rop_combo.addItem(label, path)
+            write_nodes = [n.name() for n in nuke.allNodes("Write")]
+            if write_nodes:
+                for name in write_nodes:
+                    self._write_node_combo.addItem(name, name)
+            else:
+                self._write_node_combo.addItem("No Write nodes found", "")
 
+    # ── Auth ──────────────────────────────────────────────────────────────────
     def _do_login(self):
         self._status_lbl.setText("Opening browser…")
         self._connect_btn.setEnabled(False)
@@ -573,18 +585,21 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
     @QtCore.Slot()
     def _refresh_after_login(self):
         try:
-            self._projects      = _get("/projects", self._token)
-            self._machine_types = _fetch_machine_types()
+            self._projects       = _get("/projects", self._token)
+            self._machine_types  = _fetch_machine_types()
         except Exception as e:
-            self._status_lbl.setText(f"Error: {e}")
+            self._status_lbl.setText(f"Error fetching data: {e}")
+            self._status_lbl.setStyleSheet("color:#f87171;")
             self._connect_btn.setEnabled(True)
             return
+
         self._project_combo.clear()
         for p in self._projects:
             if p.get("isActive", True):
                 self._project_combo.addItem(p["name"], str(p["id"]))
         if not self._projects:
             self._project_combo.addItem("No projects", "none")
+
         self._update_machine_list()
         self._status_lbl.setText(f"Connected as {self._email}")
         self._status_lbl.setStyleSheet("color:#22d3ee;")
@@ -595,6 +610,7 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
     def _do_logout(self):
         _clear_token()
         self._token = None
+        self._email = None
         self._status_lbl.setText("Not connected")
         self._status_lbl.setStyleSheet("color:#f87171;")
         self._connect_btn.setVisible(True)
@@ -604,42 +620,43 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
         self._project_combo.clear()
         self._machine_combo.clear()
 
+    # ── Machine list ──────────────────────────────────────────────────────────
     def _update_machine_list(self):
         inst = self._instance_combo.currentText()
         self._machine_combo.clear()
         for mid, mlabel in self._machine_types.get(inst, _FALLBACK_MACHINE_TYPES.get(inst, [])):
             self._machine_combo.addItem(mlabel, mid)
 
+    # ── Submit ────────────────────────────────────────────────────────────────
     def _do_submit(self):
         if not self._token:
             QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect first.")
             return
+
         project_id = self._project_combo.currentData()
         if not project_id or project_id == "none":
-            QtWidgets.QMessageBox.warning(self, "No project", "Select a project.")
+            QtWidgets.QMessageBox.warning(self, "No project", "Select a project before submitting.")
             return
-        rop_path = self._rop_combo.currentData()
-        if not rop_path:
-            QtWidgets.QMessageBox.warning(
-                self, "No render node selected",
-                "Select a Render Node (ROP) to submit.\n\n"
-                "If the list is empty, add an output/render node under /out "
-                "(e.g. a Mantra, Karma, Arnold, or Redshift ROP) and reopen "
-                "this dialog.")
+
+        write_node = self._write_node_combo.currentData()
+        if not write_node:
+            QtWidgets.QMessageBox.warning(self, "No Write node", "This script has no Write node to render.")
             return
+
         params = {
             "token":         self._token,
-            "title":         self._title_edit.text().strip() or "Houdini Render",
+            "title":         self._title_edit.text().strip() or "Nuke Render",
             "frames":        self._frames_edit.text().strip() or "1-1",
             "software":      self._software_combo.currentData(),
-            "renderer":      self._renderer_combo.currentData(),
-            "rop_path":      rop_path,
+            "renderer":      NUKE_RENDERER,
+            "write_node":    write_node,
             "project_id":    project_id,
             "chunk_size":    self._chunk_spin.value(),
             "instance_type": self._instance_combo.currentText(),
             "machine_type":  self._machine_combo.currentData() or "n1-4",
             "preemptible":   self._preemptible_chk.isChecked(),
         }
+
         self._submit_btn.setEnabled(False)
         self._worker = SubmitWorker(params)
         self._worker.progress.connect(self._on_progress)
@@ -647,13 +664,16 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _on_progress(self, msg): self._progress_lbl.setText(msg)
+    def _on_progress(self, msg):
+        self._progress_lbl.setText(msg)
 
     def _on_finished(self, job_number):
         self._submit_btn.setEnabled(True)
         self._progress_lbl.setText(f"✓ Submitted: {job_number}")
-        QtWidgets.QMessageBox.information(self, "Job Submitted",
-            f"Job {job_number} submitted!\n\nView at renderfarm.swade-art.com")
+        QtWidgets.QMessageBox.information(
+            self, "Job Submitted",
+            f"Job {job_number} submitted successfully!\n\nView progress at renderfarm.swade-art.com",
+        )
 
     def _on_error(self, msg):
         self._submit_btn.setEnabled(True)
@@ -664,20 +684,39 @@ class RenderfarmSubmitter(QtWidgets.QDialog):
 # ── Entry point ───────────────────────────────────────────────────────────────
 _window = None
 
+def _get_nuke_main_window():
+    """Nuke has no OpenMayaUI-style wrapInstance helper for its main window.
+    The verified approach (confirmed against the Nuke Python dev community,
+    since there's no official nuke.* API for this) is to walk Qt's own
+    top-level widget list and pick out Foundry's main window by class name:
+    Nuke's application window is a 'Foundry::UI::DockMainWindow' instance.
+    If it can't be found (e.g. running in a headless/terminal session, or
+    a Nuke version that renamed the class), we simply parent to nothing —
+    Nuke's bundled PySide2 dialogs work fine as standalone top-level
+    QDialogs without a parent."""
+    try:
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return None
+        for w in app.topLevelWidgets():
+            if w.inherits("QMainWindow") and w.metaObject().className() == "Foundry::UI::DockMainWindow":
+                return w
+    except Exception:
+        pass
+    return None
+
+
 def show():
-    """Call from a Houdini shelf button to open the submitter."""
+    """Call this from Nuke's Script Editor or a menu/toolbar item to open the submitter."""
     global _window
-    parent = None
-    if _IN_HOUDINI:
-        try:
-            parent = hou.qt.mainWindow()
-        except Exception:
-            pass
+    parent = _get_nuke_main_window() if _IN_NUKE else None
+
     if _window is not None:
         try:
             _window.close()
         except Exception:
             pass
+
     _window = RenderfarmSubmitter(parent)
     _window.setWindowFlags(_window.windowFlags() | Qt.Window)
     _window.show()
