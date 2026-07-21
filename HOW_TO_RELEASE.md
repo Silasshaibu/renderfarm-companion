@@ -57,3 +57,37 @@ https://github.com/Silasshaibu/renderfarm-companion/releases
 
 ## Download link for latest installer
 https://github.com/Silasshaibu/renderfarm-companion/releases/latest
+
+---
+
+## Shipping a DCC addon update (Blender, Maya, Houdini, Cinema 4D, 3ds Max)
+
+This is a **separate, manual process** from the Electron app release above — it does
+NOT go through `.github/workflows/release.yml` or `npm run dist`.
+
+⚠️ **Do not create a new GitHub Release for a new addon version.** The Plugins page's
+download URLs all point at `.../releases/latest/download/<asset-name>`, and GitHub's
+"latest" is whichever release is most recently published *repo-wide* — not scoped per
+addon. Publishing a fresh release moves "latest" onto it, breaking the download links
+for every other addon still pointing at the old one. Instead, **attach the new zip as
+an additional asset on the existing latest release** (currently `v2.1.3`).
+
+### Steps
+1. Bump the version string in the addon's own docstring/comment header
+   (e.g. `dcc-addons/maya/renderfarm_submitter.py` line 2).
+2. Zip just the single `.py` file at the archive root (matches how every existing
+   addon zip is structured — verify with `unzip -l` on an existing one if unsure):
+   ```powershell
+   Compress-Archive -Path "renderfarm_submitter.py" -DestinationPath "renderfarm_submitter_<dcc>_v<version>.zip" -Force
+   ```
+3. Attach it to the current latest release (check with `gh release view` first):
+   ```powershell
+   gh release upload v2.1.3 "renderfarm_submitter_<dcc>_v<version>.zip"
+   ```
+4. Update the matching entry in
+   `src/renderer/src/pages/Plugins.tsx` (`version`, `downloadUrl`, `available: true`).
+5. Rebuild the Electron app (`npm run build`) so the Plugins page picks up the change.
+
+If the "latest" release ever legitimately moves on (e.g. a real Electron app release),
+re-check every addon's `downloadUrl` in `Plugins.tsx` still resolves — re-upload the
+zips to the new latest release if not.

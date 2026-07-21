@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Renderfarm Local Worker  v2.2
+Renderfarm Local Worker  v2.3
 ==============================
 Polls the Renderfarm API for queued/pending jobs, renders them with the
-local Blender installation, uploads frames back via /api/upload, and
-marks the job done.
+local Blender or Maya installation (auto-detected from the scene file
+extension), uploads frames back via /api/upload, and marks the job done.
 
 Submission modes supported
 --------------------------
@@ -32,11 +32,13 @@ RF_TOKEN environment variable manually.
 Environment variables
 ---------------------
   BLENDER_PATH        Override the auto-detected Blender executable.
+  MAYA_RENDER_PATH    Override the auto-detected Maya Render.exe.
   RF_TOKEN            JWT auth token (overrides .rf_token file).
   RF_DOWNLOAD_DIR     Default download root for companion mode.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -268,6 +270,37 @@ def find_blender():
     return shutil.which("blender")
 
 
+# ── Maya detection ────────────────────────────────────────────────────────────
+# Maya's command-line batch renderer ships as bin\Render.exe inside each version's
+# install folder (separate from maya.exe, the interactive GUI application).
+MAYA_SEARCH_PATHS = [
+    r"C:\Program Files\Autodesk\Maya2026\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2025\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2024\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2023\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2022\bin\Render.exe",
+]
+
+# Maya addon UI renderer ids -> the value Render.exe's -r flag actually expects.
+MAYA_RENDERER_FLAGS = {
+    "arnold":   "arnold",
+    "vray":     "vray",
+    "redshift": "redshift",
+    "mayasw":   "sw",     # Maya Software
+    "mayahw":   "hw2",    # Maya Hardware 2.0
+}
+
+
+def find_maya():
+    if "MAYA_RENDER_PATH" in os.environ:
+        return os.environ["MAYA_RENDER_PATH"]
+    for path in MAYA_SEARCH_PATHS:
+        if os.path.exists(path):
+            return path
+    import shutil
+    return shutil.which("Render")
+
+
 # ── Scene preparation: v6 (zip) ───────────────────────────────────────────────
 def prepare_scene_v6(job, work_dir):
     """
@@ -315,12 +348,34 @@ def prepare_scene_v6(job, work_dir):
     return blend_file
 
 
+SCENE_FILE_GLOBS = ("*.blend", "*.ma", "*.mb", "*.hip", "*.hipnc", "*.c4d", "*.max")
+
+
+def _strip_drive(path):
+    """Strip a Windows drive letter + leading slashes, e.g. 'C:\\a\\b' -> 'a\\b'."""
+    return re.sub(r"^[A-Za-z]:[\\/]+", "", path).lstrip("/\\")
+
+
 # ── Scene preparation: v7 (per-asset manifest) ───────────────────────────────
 def prepare_scene_v7(job, work_dir):
     """
-    v7 mode: job.manifest.assets[] lists each file with its blob_url.
-    Downloads each asset to work_dir/<relative_path>.
-    Returns the absolute path to the .blend file.
+    v7 mode: job.manifest.assets[] lists each file with its blob_url (or "url").
+
+    Two conventions exist across the DCC addons:
+      - Blender addon: "path" is relative to the .blend (Blender's own "//" convention),
+        entry type "blend" marks the main scene file.
+      - Maya/Houdini/Cinema4D/3ds Max addons: "path" is an ABSOLUTE path (these DCCs
+        don't have Blender's portable relative-path convention), entry type "scene"
+        marks the main scene file.
+
+    For absolute-path assets, if the exact file already exists locally (the common
+    case when the worker runs on the same machine as the artist), it's used directly
+    with no download — this also means the scene's own internal absolute file
+    references keep resolving correctly with zero path remapping needed. Otherwise
+    it's downloaded to a reconstructed relative path under work_dir (drive letter
+    stripped) as a best-effort fallback for genuinely remote workers.
+
+    Returns the absolute path to the scene file.
     """
     manifest = job.get("manifest") or {}
     assets   = manifest.get("assets", [])
@@ -328,26 +383,29 @@ def prepare_scene_v7(job, work_dir):
     if not assets:
         raise RuntimeError("Job manifest has no assets — cannot prepare scene")
 
-    # Find the .blend entry
-    blend_asset = next((a for a in assets if a.get("type") == "blend"), None)
-    if not blend_asset:
-        raise RuntimeError("No blend asset found in job manifest")
+    scene_asset = next((a for a in assets if a.get("type") in ("blend", "scene")), None)
+    if not scene_asset:
+        raise RuntimeError("No scene asset found in job manifest")
 
     total = len(assets)
-    print(f"  [1/3] Downloading {total} assets…  (v7 mode)")
+    print(f"  [1/3] Preparing {total} asset(s)…  (v7 mode)")
 
     for i, asset in enumerate(assets, 1):
-        blob_url  = asset.get("blob_url", "")
-        rel_path  = asset.get("path", "")
-        fname     = os.path.basename(rel_path) or asset.get("name", f"asset_{i}")
+        blob_url   = asset.get("blob_url") or asset.get("url") or ""
+        orig_path  = asset.get("path", "")
+        fname      = os.path.basename(orig_path) or asset.get("name", f"asset_{i}")
         asset_type = asset.get("type", "?")
 
-        if not blob_url:
-            print(f"        [{i}/{total}] SKIP (no blob_url): {fname}")
+        if orig_path and os.path.isabs(orig_path) and os.path.isfile(orig_path):
+            asset["_local_path"] = orig_path
+            print(f"        [{i}/{total}] {asset_type}: {fname}  (already local)")
             continue
 
-        # Normalise Blender's // prefix to just the filename
-        rel_clean = rel_path.lstrip("/").lstrip("\\")
+        if not blob_url:
+            print(f"        [{i}/{total}] SKIP (no blob_url/url, not found locally): {fname}")
+            continue
+
+        rel_clean = _strip_drive(orig_path) if orig_path else fname
         if not rel_clean:
             rel_clean = fname
 
@@ -363,21 +421,21 @@ def prepare_scene_v7(job, work_dir):
 
         print(f"        [{i}/{total}] {asset_type}: {fname} {size_str}")
         download_file(blob_url, dest)
+        asset["_local_path"] = dest
 
-    # Locate the downloaded .blend file
-    blend_rel  = blend_asset.get("path", "").lstrip("/").lstrip("\\")
-    blend_name = blend_asset.get("name", os.path.basename(blend_rel))
-    blend_file = os.path.join(work_dir, blend_rel) if blend_rel else None
-
-    if not blend_file or not os.path.isfile(blend_file):
-        # Fallback: search for any .blend
-        found = list(Path(work_dir).glob("**/*.blend"))
+    scene_file = scene_asset.get("_local_path")
+    if not scene_file or not os.path.isfile(scene_file):
+        found = []
+        for pattern in SCENE_FILE_GLOBS:
+            found = list(Path(work_dir).glob(f"**/{pattern}"))
+            if found:
+                break
         if not found:
-            raise RuntimeError("Could not locate downloaded .blend file")
-        blend_file = str(found[0])
+            raise RuntimeError("Could not locate the scene file after asset preparation")
+        scene_file = str(found[0])
 
-    print(f"        Blend: {os.path.basename(blend_file)}")
-    return blend_file
+    print(f"        Scene: {os.path.basename(scene_file)}")
+    return scene_file
 
 
 # ── Scout-frame expression resolver ──────────────────────────────────────────
@@ -448,7 +506,7 @@ def _parse_frames(frames_str):
 
 
 # ── Job rendering ─────────────────────────────────────────────────────────────
-def render_job(job, blender_path, token):
+def render_job(job, blender_path, maya_path, token):
     job_id  = job["id"]
     # Accept both camelCase (API) and snake_case (raw DB)
     job_num   = job.get("jobNumber") or job.get("job_number", "?")
@@ -475,7 +533,7 @@ def render_job(job, blender_path, token):
 
     # Detect submission mode
     assets       = manifest.get("assets", [])
-    has_blob_url = any(a.get("blob_url") for a in assets)
+    has_blob_url = any(a.get("blob_url") or a.get("url") for a in assets)
     use_v7       = bool(assets and has_blob_url)
 
     # Instance type from manifest (set by Blender addon v7+)
@@ -559,25 +617,72 @@ def render_job(job, blender_path, token):
         else:
             blend_file = prepare_scene_v6(job, work_dir)
 
+        # ── Engine detection ───────────────────────────────────────────
+        scene_ext = os.path.splitext(blend_file)[1].lower()
+        is_maya   = scene_ext in (".ma", ".mb")
+
         # ── Render ────────────────────────────────────────────────────
         output_dir = os.path.join(work_dir, "renders")
         os.makedirs(output_dir, exist_ok=True)
-        output_pattern = os.path.join(output_dir, "frame_####")
+
+        if is_maya:
+            if not maya_path:
+                raise RuntimeError(
+                    "Job is a Maya scene (.ma/.mb) but no Maya installation was found "
+                    "on this worker. Install Maya or set MAYA_RENDER_PATH.")
+            renderer_id  = str(manifest.get("renderer", "arnold")).lower()
+            renderer_flag = MAYA_RENDERER_FLAGS.get(renderer_id, renderer_id)
+            engine_name  = "Maya"
+
+            def _build_cmd(frame_start, frame_end):
+                return [
+                    maya_path,
+                    "-r", renderer_flag,
+                    "-s", str(frame_start),
+                    "-e", str(frame_end),
+                    "-of", "png",
+                    "-rd", output_dir,
+                    # Best-effort: helps resolve relative texture references when
+                    # sourceimages/etc. sit alongside the scene file. Absolute
+                    # references (the common case for these DCC addons) work
+                    # regardless, since prepare_scene_v7() prefers using assets
+                    # already present at their original local path.
+                    "-proj", os.path.dirname(blend_file),
+                    blend_file,
+                ]
+        else:
+            if not blender_path:
+                raise RuntimeError(
+                    "Job is a Blender scene (.blend) but no Blender installation was "
+                    "found on this worker. Install Blender or set BLENDER_PATH.")
+            output_pattern = os.path.join(output_dir, "frame_####")
+            engine_name = "Blender"
+
+            def _build_cmd(frame_start, frame_end):
+                if frame_start == frame_end:
+                    return [
+                        blender_path,
+                        "--background", blend_file,
+                        "--render-output", output_pattern,
+                        "--render-format", "PNG",
+                        "--render-frame", str(frame_start),
+                    ]
+                return [
+                    blender_path,
+                    "--background", blend_file,
+                    "--render-output", output_pattern,
+                    "--render-format", "PNG",
+                    "--frame-start", str(frame_start),
+                    "--frame-end",   str(frame_end),
+                    "--render-anim",
+                ]
 
         all_log_lines = []
 
         if is_contiguous:
-            # ── Normal mode: one Blender call for the full range ──────────────
-            print(f"  [2/3] Rendering frames {start}–{end} with Blender…")
-            cmd = [
-                blender_path,
-                "--background", blend_file,
-                "--render-output", output_pattern,
-                "--render-format", "PNG",
-                "--frame-start", start,
-                "--frame-end",   end,
-                "--render-anim",
-            ]
+            # ── Normal mode: one call for the full range ──────────────────────
+            print(f"  [2/3] Rendering frames {start}–{end} with {engine_name}…")
+            cmd = _build_cmd(frame_list[0], frame_list[-1])
             try:
                 proc = subprocess.run(
                     cmd,
@@ -588,7 +693,7 @@ def render_job(job, blender_path, token):
                 )
             except subprocess.TimeoutExpired as exc:
                 hrs = effective_timeout / 3600
-                msg = (f"Blender exceeded the {hrs:.1f}h max runtime "
+                msg = (f"{engine_name} exceeded the {hrs:.1f}h max runtime "
                        f"({runtime_action}) — job killed.")
                 print(f"\n  ⚠  {msg}")
                 post_wrangler_event(
@@ -600,22 +705,16 @@ def render_job(job, blender_path, token):
             for line in all_log_lines[-20:]:
                 print(f"    {line}")
             if proc.returncode != 0:
-                raise RuntimeError(f"Blender exited with code {proc.returncode}")
+                raise RuntimeError(f"{engine_name} exited with code {proc.returncode}")
 
         else:
-            # ── Scout mode: one Blender call per specific frame ───────────────
+            # ── Scout mode: one call per specific frame ───────────────────────
             # Per-frame timeout = effective_timeout / total_frames (min 10 min)
             per_frame_timeout = max(600, effective_timeout // max(total_frames, 1))
             print(f"  [2/3] Scout render — {total_frames} frame(s): {', '.join(str(f) for f in frame_list)}")
             for fi, frame_num in enumerate(frame_list):
                 print(f"        [{fi + 1}/{total_frames}] frame {frame_num}…")
-                cmd = [
-                    blender_path,
-                    "--background", blend_file,
-                    "--render-output", output_pattern,
-                    "--render-format", "PNG",
-                    "--render-frame", str(frame_num),
-                ]
+                cmd = _build_cmd(frame_num, frame_num)
                 try:
                     proc = subprocess.run(
                         cmd,
@@ -637,9 +736,9 @@ def render_job(job, blender_path, token):
                 for line in lines[-5:]:
                     print(f"    {line}")
                 if proc.returncode != 0:
-                    raise RuntimeError(f"Blender exited {proc.returncode} on frame {frame_num}")
+                    raise RuntimeError(f"{engine_name} exited {proc.returncode} on frame {frame_num}")
 
-        # POST Blender output to task-log API (task index 0, best-effort)
+        # POST render output to task-log API (task index 0, best-effort)
         if all_log_lines:
             info_lines  = [l for l in all_log_lines
                            if not any(k in l.lower() for k in ("error", "exception", "traceback"))]
@@ -649,14 +748,16 @@ def render_job(job, blender_path, token):
             post_logs(job_num, 0, error_lines, token, level="error")
 
         # ── Upload frames ─────────────────────────────────────────────
-        # Collect rendered files in frame-number order (Blender names them frame_XXXX.*)
+        # Collect rendered files in frame-number order (Blender names them frame_XXXX.*;
+        # Maya's own naming convention varies by scene settings, so we just match by
+        # extension rather than an exact filename pattern).
         frame_files = sorted(
             f for f in Path(output_dir).iterdir()
             if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
         )
 
         if not frame_files:
-            raise RuntimeError("Blender produced no output frames")
+            raise RuntimeError(f"{engine_name} produced no output frames")
 
         print(f"  [3/3] Uploading {len(frame_files)} frame(s) to Vercel Blob…")
         frame_urls = []
@@ -842,7 +943,7 @@ def main():
         return
 
     print("=" * 60)
-    print("  Renderfarm Local Worker  v2.2  (supports v6 + v7 jobs)")
+    print("  Renderfarm Local Worker  v2.3  (supports v6 + v7 jobs; Blender + Maya)")
     print("=" * 60)
 
     token, email = load_token()
@@ -853,15 +954,16 @@ def main():
         sys.exit(1)
 
     blender = find_blender()
-    if not blender:
-        print("\nERROR: Blender executable not found.")
-        print("  Install Blender, or set the BLENDER_PATH environment variable.")
-        print(f"  Searched: {BLENDER_SEARCH_PATHS[0]}")
+    maya    = find_maya()
+    if not blender and not maya:
+        print("\nERROR: Neither Blender nor Maya was found on this machine.")
+        print("  Install one of them, or set BLENDER_PATH / MAYA_RENDER_PATH.")
         sys.exit(1)
 
     print(f"\n  API:     {API_BASE}")
     print(f"  User:    {email}")
-    print(f"  Blender: {blender}")
+    print(f"  Blender: {blender or '(not found — Blender jobs will fail)'}")
+    print(f"  Maya:    {maya or '(not found — Maya jobs will fail)'}")
     print(f"  Polling every {POLL_INTERVAL}s for pending/queued jobs…")
     print()
 
@@ -896,7 +998,7 @@ def main():
                 # Oldest job first (lowest id)
                 job = sorted(ready, key=lambda j: int(j["id"]))[0]
                 try:
-                    render_job(job, blender, token)
+                    render_job(job, blender, maya, token)
                 except Exception as e:
                     jnum = job.get("jobNumber") or job.get("job_number", job["id"])
                     print(f"\n  ERROR rendering {jnum}: {e}")

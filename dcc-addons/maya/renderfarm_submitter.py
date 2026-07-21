@@ -1,5 +1,5 @@
 """
-Renderfarm Maya Submitter v1.0.0
+Renderfarm Maya Submitter v1.1.0
 Submit Maya render jobs to Renderfarm directly from Maya.
 
 Installation:
@@ -375,12 +375,18 @@ class SubmitWorker(QThread):
             url_map = {a["path"]: a.get("url", "") for a in valid}
 
             # 5. Finalize
+            # NOTE: asset entries use "blob_url" (not "url") — that's the key the
+            # render worker's prepare_scene_v7() reads. instance_type is read by
+            # the worker's GPU-availability check.
             self.progress.emit("Finalising job…")
             manifest = {
-                "scene":    os.path.basename(scene_file),
-                "software": p["software"],
-                "renderer": p["renderer"],
-                "assets":   [{"path": a["path"], "sha256": a["sha256"], "size_bytes": a["size"], "type": a["type"], "url": url_map.get(a["path"], "")} for a in valid],
+                "scene":         os.path.basename(scene_file),
+                "software":      p["software"],
+                "renderer":      p["renderer"],
+                "instance_type": p["instance_type"],
+                "machine_type":  p["machine_type"],
+                "chunk_size":    p["chunk_size"],
+                "assets":        [{"path": a["path"], "sha256": a["sha256"], "size_bytes": a["size"], "type": a["type"], "blob_url": url_map.get(a["path"], "")} for a in valid],
             }
             _patch(f"/jobs?id={job_id}", {
                 "status":          "pending",

@@ -31,14 +31,21 @@ interface Plugin {
 
 const BLENDER_VERSIONS: PluginVersion[] = [
   {
-    label:       'v7.0.1 — Blender 3.x / 4.x / 5.x (Recommended)',
-    version:     '7.0.1',
-    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_v7.zip',
+    label:       'v2.1.3 — Blender 3.x / 4.x / 5.x (Recommended)',
+    version:     '2.1.3',
+    // NOTE: was previously 'renderfarm_submitter_v7.zip', which does not exist as a
+    // release asset (404) — the real asset attached to the latest release is named
+    // renderfarm_submitter_v2.1.3.zip. Fixed here; keep this in sync with whatever
+    // gets attached to the "latest" GitHub release going forward.
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_v2.1.3.zip',
   },
+]
+
+const MAYA_VERSIONS: PluginVersion[] = [
   {
-    label:       'v7.0.0 — Blender 3.x / 4.x',
-    version:     '7.0.0',
-    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_v7.zip',
+    label:       'v1.1.0 — Maya 2019–2025 (all platforms)',
+    version:     '1.1.0',
+    downloadUrl: 'https://github.com/Silasshaibu/renderfarm-companion/releases/latest/download/renderfarm_submitter_maya_v1.1.0.zip',
   },
 ]
 
@@ -46,7 +53,8 @@ const PLUGINS: Plugin[] = [
   {
     id: 'maya', name: 'Renderfarm for Maya',
     description: 'Maya plugin node to manage submissions to the render farm. Supports Maya versions from 2019 to 2025 on all platforms.',
-    version: '0.0.0', icon: 'M', iconColor: '#3b82f6', available: false,
+    version: '1.1.0', icon: 'M', iconColor: '#3b82f6', available: true,
+    versions: MAYA_VERSIONS,
   },
   {
     id: 'cinema4d', name: 'Renderfarm for Cinema 4D',
@@ -56,7 +64,7 @@ const PLUGINS: Plugin[] = [
   {
     id: 'blender', name: 'Renderfarm for Blender',
     description: 'A plugin to submit render jobs from Blender. Supports Blender 3.x, 4.x and 5.x on all platforms.',
-    version: '7.0.1', installedVersion: '7', hasUpdate: true,
+    version: '2.1.3',
     icon: 'B', iconColor: '#f97316', available: true,
     versions: BLENDER_VERSIONS,
   },
@@ -93,7 +101,7 @@ interface PluginsPageProps {
 }
 
 export default function PluginsPage({ pluginsPath: _pluginsPath, onRefresh: _onRefresh }: PluginsPageProps = {}) {
-  const [installed,    setInstalled]    = useState<Record<string, string>>({ blender: '7' })
+  const [installed,    setInstalled]    = useState<Record<string, string>>({})
   const [installing,   setInstalling]   = useState<Set<string>>(new Set())
   const [dropdownOpen, setDropdownOpen] = useState<string | null>(null)
   const [noticeFor,    setNoticeFor]    = useState<string | null>(null)  // plugin id showing "not yet released"
